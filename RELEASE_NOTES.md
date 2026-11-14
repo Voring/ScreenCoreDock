@@ -1,63 +1,61 @@
-# ScreenCoreDock v0.1.3
+# ScreenCoreDock v0.1.4
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.1.3`
+- 版本：`0.1.4`
 - 架构：`iphoneos-arm64`（fat，含 arm64 + arm64e 切片）
 - 打包方案：`roothide`
 
-## 本版改动：贴边吸附 + 离边自由摆放
+## 本版要解决的 bug（v0.1.3 已装的可直接升级）
 
-工具「全屏转ScreenCore分屏」→ 前台应用变为**侧贴小卡片浮窗**，交互规则：
+**症状**：侧贴卡片拖离两侧边缘后，卡片被放大到覆盖大半个屏幕。
 
-- **松手贴近左/右边缘** → 清除自由位置，回到插件原本的侧贴槽位吸附逻辑（按顺序排回边缘）；
-- **松手偏离两侧边缘** → 停在当前落点，任意位置自由移动，不再回槽位。
+**原因**：v0.1.3 把“自由位置”存成了一个完整的 `CGRect`，其中尺寸是用 `record.normalFrame` 推的。
+`-sc_applyFrame:toRecord:` 内部会调 `-sc_dockTransformForRecord:targetFrame:`，这个函数按
+「目标帧尺寸 ÷ normalFrame 尺寸」算视觉缩放。一旦我们给的尺寸大于 real 尺寸（normalFrame 为零或异常时就会发生），
+缩放比就被放大，卡片直接糊满屏。
 
-### 为什么原来的侧贴不能自由移动
+**修法**：自由位置只存**一个中心点**，尺寸一律沿用插件自己算好的槽位尺寸。
 
-侧贴卡片的坐标不是绝对坐标，而是 `(side, order)` 的函数：
+- `-sc_targetFramesForSide:`：把槽位 **平移**到该中心（尺寸不变）；
+- `-sc_applyFrame:toRecord:`：兜底时只改原点，不碰 size；
+- 新增 `sc_clampCenter`：中心点夹在 host 内，保证整张卡片不越界。
 
-```
-拖拽结束  -sc_moveDraggingRecord:toSide:center:
-        → -sc_updateNormalizedYForOrder:     // 落点 Y 被归一化成 order 序号
-        → -sc_layoutSide:animated:completion:
-           → -sc_targetFramesForSide:          // 按 (side, order) 重算所有槽位
-           → -sc_applyFrame:toRecord:          // 逐个应用，卡片回到槽位
-```
+## 完整交互规则
 
-### 本版补丁点（3 个 hook）
+- **松手贴近左/右边缘**（默认 90pt 内）→ 清除自由位置，回原插件侧贴槽位吸附（按顺序排列）；
+- **松手偏离两侧边缘** → 卡片停在落点，任意位置自由摆放，不再回槽位；
+- 卡片**尺寸不变**（插件本身不提供调整大小）；
+- 自由位置不持久化，record 销毁后回槽位。
 
-| Hook | 作用 |
-|---|---|
-| `-sc_moveDraggingRecord:toSide:center:` | 用传入的 center（hostRootView 坐标系）判断是否贴边；贴边清掉自由 frame，离边按落点 center + 卡片现有尺寸构造自由 frame 存到 record 关联对象 |
-| `-sc_targetFramesForSide:` | 槽位表里「有自由 frame」的 record，槽位换成自由 frame |
-| `-sc_applyFrame:toRecord:` | 落帧前兜底：有自由 frame 就用自由 frame 覆盖传入帧 |
-
-贴边判定阈值 `SC_EDGE_SNAP_INSET`（默认 90pt），在 `Tweak.xm` 顶部可改。
+阈值在 `Tweak.xm` 顶部：`#define SC_EDGE_SNAP_INSET 90.0`。
 
 ## 安装
 
 1. 已安装 ScreenCore 2.0.5；
-2. 安装 roothide deb；
+2. 安装 roothide deb（覆盖升级会自动替换旧版）；
 3. respring 或重启 SpringBoard。
 
 ## 验证与日志
 
-- 全屏 App → ARC 点「全屏转ScreenCore分屏」→ 变成侧贴小卡片；
-- 拖到屏幕中间松手 → 应停在那里；拖回左/右边缘松手 → 应吸附回原槽位；
-- 日志：`log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'`，应看到：
-  - `hooked (mode=2, dockClass=..., edgeInset=90)`
-  - `drop free (...) -> free frame {...}` 或 `drop near edge (...) -> snap to slot`
-  - `free frame applied for record ... -> {...}` / `applyFrame free ...`
+`log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'`
 
-## 已知限制 / 待真机确认
+应看到：
 
-- 拖到屏幕外侧（插件判定为“向外拖关闭”）时仍会关闭，本版未改 `sc_shouldDismissRecordOutward:center:velocity:`。
-- 卡片尺寸仍由原插件决定（不可调整大小）；本版只改位置。
-- 自由位置不持久化：record 被销毁（关闭/展开/重开）后回到槽位；如需跨重启记忆，下版写进 prefs。
+- `hooked (mode=2, dockClass=..., edgeInset=90)`
+- 拖动中间松手：`drop free (side=..., center=...)`
+- 拖回边缘松手：`drop near edge (...) -> snap to slot`
+- 重排时：`free center applied for record ... -> {...} (slot {...})` —— 两者尺寸应一致
+- `applyFrame moved {...} -> {...}` —— 新旧 rect 尺寸应一致
+
+**如果尺寸还是变大**：把 `applyFrame moved` 与 `free center applied` 两行日志的 rect 发我，能直接看出是哪一层尺寸不对。
+
+## 已知限制
+
+- 拖到屏幕外侧（插件判定为“向外拖关闭”）仍会关闭，本版未改。
 - 多个卡片各自自由摆放，但 z 序仍由插件按 order 维护。
-- 本版尚未经真机验证；若竖直方向仍被夹在边缘竖条内，说明 `didMoveToCenter` 收尾处还有一层内联的 y 向夹紧，需要再加 hook，日志里能据此判断。
+- 竖直方向如仍被限制在边缘竖条内，说明 `didMoveToCenter` 收尾处还有一层内联 y 向夹紧，需再加 hook。
 
 ## 逆向备忘（arm64 切片，未滑动地址）
 
@@ -72,5 +70,6 @@
 | `0x3a384` | `-sc_targetFramesForSide:` |
 | `0x3b1fc` | `-sc_layoutSide:animated:completion:` |
 | `0x3ac70` | `-sc_applyFrame:toRecord:` |
+| `0x3ab14` | `-sc_dockTransformForRecord:targetFrame:` |
 | `0x3e5e4` | `-sc_moveDraggingRecord:toSide:center:` |
 | `0x3f200` | `-sc_dockedFloatingItemView:didMoveToCenter:state:velocity:` |
