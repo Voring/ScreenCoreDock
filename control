@@ -1,8 +1,8 @@
 Package: com.voring.screencoredock
 Name: ScreenCoreDock
-Version: 0.1.2
+Version: 0.1.3
 Architecture: iphoneos-arm64
-Description: 把 ScreenCore「全屏转ScreenCore分屏」改为「侧贴卡片浮窗，位置可自由摆放」
+Description: 把 ScreenCore「全屏转ScreenCore分屏」改为「侧贴卡片浮窗，贴边吸附、离边自由摆放」
 Maintainer: Voring
 Author: Voring
 Section: Tweaks
