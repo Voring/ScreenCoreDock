@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.scheme }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [ rootless, roothide ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: |
+          brew install ldid || true
+          which ldid || echo "ldid not found, will rely on Theos fallback"
+
+      - name: Set up Theos
+        run: |
+          set -e
+          export THEOS="$RUNNER_TEMP/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          git clone --recursive --depth=1 https://github.com/roothide/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+
+          # 只取 iOS 16.5 SDK，避免整包 sdks 仓库
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks
+          SDK_DIR=$(git ls-tree -d --name-only HEAD | grep -E 'iPhoneOS16\.5' | head -1)
+          echo "SDK_DIR=$SDK_DIR"
+          git sparse-checkout set "$SDK_DIR"
+          cp -R "$SDK_DIR" "$THEOS/sdks/"
+          ls "$THEOS/sdks"
+
+      - name: Build
+        run: |
+          set -e
+          export THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          make clean || true
+          make package FINALPACKAGE=1
+          ls -l packages/
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenCoreDock-${{ matrix.scheme }}
+          path: packages/*.deb
+          if-no-files-found: error
