@@ -13,8 +13,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
-    permissions:
-      contents: write
+    outputs:
+      result: ${{ job.status }}
 
     steps:
       - name: Checkout
@@ -32,7 +32,7 @@ jobs:
       - name: Install ldid
         run: |
           brew install ldid || brew install ProcursusTeam/ldid/ldid || true
-          which ldid && ldid -v || echo "ldid unavailable (will see if Theos needs it)"
+          which ldid && ldid -v || echo "ldid unavailable"
 
       - name: Set up Theos
         run: |
@@ -40,27 +40,27 @@ jobs:
           export THEOS="$RUNNER_TEMP/theos"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           git clone --recursive --depth=1 https://github.com/roothide/theos.git "$THEOS"
-          test -d "$THEOS/makefiles" && echo "makefiles ok"
-          test -d "$THEOS/vendor" || true
+          test -d "$THEOS/makefiles"
 
-          # 只取 iOS 16.5 SDK（theos/sdks 仓库很大，用 partial clone）
           git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
           cd /tmp/sdks
-          git ls-tree -d --name-only HEAD | sort | head -30
           SDK_DIR="$(git ls-tree -d --name-only HEAD | grep -E '^iPhoneOS16\.5' | head -1)"
-          test -n "$SDK_DIR" || { echo 'SDK dir not found'; exit 1; }
+          test -n "$SDK_DIR" || { echo 'SDK dir not found'; git ls-tree -d --name-only HEAD; exit 1; }
           echo "SDK_DIR=$SDK_DIR"
           git sparse-checkout set "$SDK_DIR"
           cp -R "$SDK_DIR" "$THEOS/sdks/"
           ls -la "$THEOS/sdks"
-          test -f "$THEOS/sdks/$SDK_DIR/SDKSettings.plist" && echo "SDK ok"
 
       - name: Build (roothide)
         run: |
           set -o pipefail
           export THEOS_PACKAGE_SCHEME=roothide
-          make clean 2>&1 | tee build.log || true
-          make package FINALPACKAGE=1 2>&1 | tee -a build.log
+          { echo "=== xcodebuild ==="; xcodebuild -version || true;
+            echo "=== env ==="; env | grep -E 'THEOS|SCHEME|GITHUB_SHA' || true;
+            echo "=== make clean ==="; make clean || true;
+            echo "=== make package ==="; make package FINALPACKAGE=1;
+            echo "=== packages ==="; ls -lh packages/ || true;
+          } 2>&1 | tee build.log
           ls -lh packages/
 
       - name: Upload deb
@@ -79,19 +79,67 @@ jobs:
           path: build.log
           if-no-files-found: warn
 
-      - name: Dump failure summary
-        if: failure()
+  report:
+    name: write ci report
+    needs: [ build ]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch build log
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/log
+
+      - name: Compose report
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
         run: |
+          set -euo pipefail
+          mkdir -p ci
           {
-            echo '## Build failed'
+            echo "# CI 构建报告"
+            echo
+            echo "- workflow: \`$GITHUB_WORKFLOW\`"
+            echo "- run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- build result: **$BUILD_RESULT**"
+            echo "- generated at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## build.log（末尾 500 行）"
+            echo
+            echo '```log'
+            if [ -f /tmp/log/build.log ]; then
+              tail -n 500 /tmp/log/build.log
+            else
+              echo 'build.log 未上传（可能 job 在建 log 前就失败，例如 runner 获取失败）'
+            fi
             echo '```'
-            tail -n 60 build.log 2>/dev/null || echo 'no build.log'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > ci/last-build.md
+          wc -l ci/last-build.md
+
+      - name: Push report to ci-status branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B ci-status
+          git add -f ci/last-build.md
+          git commit -m "ci: build report for ${GITHUB_SHA:0:7} [skip ci]" || echo "nothing to commit"
+          git push -f origin ci-status
 
   release:
     needs: build
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: success() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
