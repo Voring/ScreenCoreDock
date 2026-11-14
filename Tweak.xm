@@ -3,12 +3,11 @@
 //  ScreenCoreDock
 //
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
-//  (system-tool:fullscreen-to-screencore-split) 的产物，改造成「侧贴小卡片浮窗，且可自由摆放」。
+//  (system-tool:fullscreen-to-screencore-split) 的产物，改造成「侧贴小卡片浮窗」。
 //
-//  编译期模式：
-//    SC_DOCK_MODE 0 = 小尺寸普通浮窗（可拖可缩放，但不是卡片形态）
-//    SC_DOCK_MODE 1 = 侧贴卡片，位置由 dockManager 槽位决定（不可自由摆放）
-//    SC_DOCK_MODE 2 = 侧贴卡片 + 自由摆放（默认，你要的那种）
+//  交互规则（本版 v0.1.3）：
+//    - 松手位置贴近左/右边缘  -> 清除自由位置，回到插件原本的侧贴槽位吸附逻辑；
+//    - 松手位置偏离两侧边缘  -> 停在当前位置，任意摆放，不再回槽位。
 //
 //  侧贴为什么天然不能自由移动：
 //    拖拽结束 -> -sc_moveDraggingRecord:toSide:center:
@@ -17,18 +16,26 @@
 //                -> -sc_targetFramesForSide: 按 (side, order) 重新算所有槽位
 //                -> -sc_applyFrame:toRecord: 逐个应用
 //    所以卡片坐标 = f(side, order)，松手必回槽位。
-//  做法：hook -sc_targetFramesForSide:，把「有自定义位置」的 record 的槽位替换成用户拖到的矩形；
-//       在 -sc_moveDraggingRecord:toSide:center: 落地时把当时 itemView 的 frame 记下来。
+//
+//  本版补丁点：
+//    1) -sc_moveDraggingRecord:toSide:center:
+//         用传入的 center（hostRootView 坐标系）判断是否贴边；
+//         贴边 -> 清掉关联的自由 frame；偏离 -> 以落点 center + record.normalFrame 尺寸
+//         构造自由 frame，存到 record 的关联对象。
+//    2) -sc_targetFramesForSide:
+//         槽位表里「有自由 frame」的 record，槽位换成自由 frame。
+//    3) -sc_applyFrame:toRecord:
+//         真正落帧前再兜底一次：有自由 frame 就用自由 frame 覆盖传入帧。
 //
 //  逆向依据（ScreenCore.dylib 2.0.5 arm64 切片，未滑动虚拟地址）：
 //    _SCFullscreenToSplitToolPerform                    0x113a4
 //      -> -sc_openFrontmostApplicationAsSplitFromSourceRect:   0x48eb8
-//         -> -sc_openSplitForBundleIdentifier:presentationSourceRect:  0x46cf4
-//            -> ... 0x47f60（建窗口）
-//    frame: -sc_rememberedFrameForTargetIdentifier:... 0x43f1c / -sc_defaultContainerFrameForReferenceSize:hostBounds: 0x43c1c
-//    dock : -sc_dockSession:fromCorner: 0x463ac / -sc_dockSessionForSingleActiveWindow: 0x462e4
+//    frame: -sc_rememberedFrameForTargetIdentifier:... 0x43f1c / -sc_defaultContainerFrame... 0x43c1c
+//    dock : -sc_dockSession:fromCorner: 0x463ac
 //    布局: -sc_targetFramesForSide: 0x3a384 / -sc_layoutSide:animated:completion: 0x3b1fc
-//          -sc_moveDraggingRecord:toSide:center: （stub 0x6af20）
+//          -sc_applyFrame:toRecord: 0x3ac70
+//          -sc_moveDraggingRecord:toSide:center: 0x3e5e4
+//          -sc_dockedFloatingItemView:didMoveToCenter:state:velocity: 0x3f200
 //
 
 #import <Foundation/Foundation.h>
@@ -41,15 +48,9 @@
 #define SC_DOCK_MODE 2
 #endif
 
-// Theos/roothide 默认开 -Werror：没被当前模式用到的静态函数会直接编译失败，统一标注 unused
-#define SC_UNUSED __attribute__((unused))
-
-// 仅 SC_DOCK_MODE == 0 时使用
-#ifndef SC_FLOAT_WIDTH_RATIO
-#define SC_FLOAT_WIDTH_RATIO 0.45
-#endif
-#ifndef SC_FLOAT_MAX_HEIGHT_RATIO
-#define SC_FLOAT_MAX_HEIGHT_RATIO 0.70
+// 距离左/右边缘多少 pt 以内视为「贴边」，走原槽位吸附
+#ifndef SC_EDGE_SNAP_INSET
+#define SC_EDGE_SNAP_INSET 90.0
 #endif
 
 #define SC_DOMAIN CFSTR("com.susudear.screencore")
@@ -58,13 +59,6 @@
 @interface SCFloatingSceneManager : NSObject
 - (BOOL)sc_openFrontmostApplicationAsSplitFromSourceRect:(CGRect)rect;
 - (id)activeSession;
-- (CGRect)sc_hostBoundsForActiveOrientation;
-- (CGRect)sc_defaultContainerFrameForReferenceSize:(CGSize)referenceSize hostBounds:(CGRect)hostBounds;
-- (CGRect)sc_rememberedFrameForTargetIdentifier:(id)target
-                                   hostLandscape:(BOOL)hostLandscape
-                                contentLandscape:(BOOL)contentLandscape
-                                   referenceSize:(CGSize)referenceSize
-                                        fallback:(CGRect)fallback;
 - (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
 @end
@@ -73,66 +67,17 @@
 - (id)itemView;
 - (id)session;
 - (NSInteger)side;
+- (CGRect)normalFrame;
 @end
 
 @interface SCFloatingDockManager : NSObject
+- (UIView *)hostRootView;
 - (NSDictionary *)sc_targetFramesForSide:(NSInteger)side;
 - (void)sc_moveDraggingRecord:(id)record toSide:(NSInteger)side center:(CGPoint)center;
+- (void)sc_applyFrame:(CGRect)frame toRecord:(id)record;
 @end
 
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
-
-#pragma mark - 小尺寸自由浮窗（mode 0）
-
-#if SC_DOCK_MODE == 0
-
-static CGRect (*orig_defaultContainerFrame)(id, SEL, CGSize, CGRect);
-static CGRect (*orig_rememberedFrame)(id, SEL, id, BOOL, BOOL, CGSize, CGRect);
-
-static BOOL gInToolCall = NO;
-static BOOL gShrunk = NO;
-
-static CGRect sc_smallFrameForFrame(CGRect original, CGRect host) {
-    if (host.size.width < 1 || host.size.height < 1) host = [UIScreen mainScreen].bounds;
-    CGFloat ratio = (original.size.width > 1) ? (original.size.height / original.size.width) : 1.0;
-    if (ratio < 0.5 || ratio > 2.5) ratio = host.size.height / host.size.width;
-
-    CGFloat w = host.size.width * SC_FLOAT_WIDTH_RATIO;
-    CGFloat h = w * ratio;
-    CGFloat maxH = host.size.height * SC_FLOAT_MAX_HEIGHT_RATIO;
-    if (h > maxH) { h = maxH; w = h / ratio; }
-    if (w < 120.0) { w = 120.0; h = w * ratio; }
-
-    return CGRectMake(CGRectGetMidX(host) - w / 2.0, CGRectGetMidY(host) - h / 2.0, w, h);
-}
-
-static CGRect sc_maybeShrink(id manager, CGRect frame) {
-    if (!gInToolCall || gShrunk) return frame;
-    gShrunk = YES;
-    CGRect host = CGRectNull;
-    if ([manager respondsToSelector:@selector(sc_hostBoundsForActiveOrientation)]) {
-        host = [manager sc_hostBoundsForActiveOrientation];
-    }
-    if (CGRectIsEmpty(host) || host.size.width < 1) host = [UIScreen mainScreen].bounds;
-
-    CGRect small = sc_smallFrameForFrame(frame, host);
-    SC_LOG(@"shrink frame %@ -> %@", NSStringFromCGRect(frame), NSStringFromCGRect(small));
-    return small;
-}
-
-static CGRect hook_defaultContainerFrame(id self, SEL _cmd, CGSize referenceSize, CGRect hostBounds) {
-    CGRect frame = orig_defaultContainerFrame(self, _cmd, referenceSize, hostBounds);
-    return sc_maybeShrink(self, frame);
-}
-
-static CGRect hook_rememberedFrame(id self, SEL _cmd, id target, BOOL hostLandscape,
-                                   BOOL contentLandscape, CGSize referenceSize, CGRect fallback) {
-    CGRect frame = orig_rememberedFrame(self, _cmd, target, hostLandscape,
-                                        contentLandscape, referenceSize, fallback);
-    return sc_maybeShrink(self, frame);
-}
-
-#endif // SC_DOCK_MODE == 0
 
 #pragma mark - 侧贴（mode 1 / 2）
 
@@ -167,10 +112,54 @@ static void sc_dockSessionIfPossible(SCFloatingSceneManager *manager) {
 
 static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
 static void (*orig_moveDraggingRecord)(id, SEL, id, NSInteger, CGPoint);
+static void (*orig_applyFrame)(id, SEL, CGRect, id);
 
-static char kFreeFrameKey;   // record -> NSValue(CGRect)：用户摆的绝对位置
+static char kFreeFrameKey;   // record -> NSValue(CGRect)：用户摆的绝对位置（hostRootView 坐标系）
 
-/// 把槽位表里「用户摆过位置」的 record 换成它的自定义矩形
+static CGRect sc_hostBounds(id manager) {
+    CGRect host = CGRectNull;
+    @try {
+        UIView *root = [(SCFloatingDockManager *)manager hostRootView];
+        if (root) host = root.bounds;
+    } @catch (__unused NSException *e) {}
+    if (CGRectIsEmpty(host) || host.size.width < 1) host = [UIScreen mainScreen].bounds;
+    return host;
+}
+
+static BOOL sc_isNearEdge(CGRect host, CGPoint center) {
+    CGFloat inset = SC_EDGE_SNAP_INSET;
+    return center.x <= CGRectGetMinX(host) + inset ||
+           center.x >= CGRectGetMaxX(host) - inset;
+}
+
+/// 以落点 center 为中心、record 现有尺寸构造自由帧，并夹在 host 范围内
+static CGRect sc_freeFrameForRecord(id record, CGPoint center, CGRect host) {
+    CGRect nf = [record normalFrame];
+    CGSize size = nf.size;
+    if (size.width < 1 || size.height < 1) {
+        @try {
+            id view = [(SCFloatingDockRecord *)record itemView];
+            if (view) size = [view frame].size;
+        } @catch (__unused NSException *e) {}
+    }
+    if (size.width < 1) size.width = 200.0;
+    if (size.height < 1) size.height = 300.0;
+
+    CGFloat x = center.x - size.width / 2.0;
+    CGFloat y = center.y - size.height / 2.0;
+
+    CGFloat minX = CGRectGetMinX(host);
+    CGFloat maxX = CGRectGetMaxX(host) - size.width;
+    CGFloat minY = CGRectGetMinY(host);
+    CGFloat maxY = CGRectGetMaxY(host) - size.height;
+    if (maxX < minX) maxX = minX;
+    if (maxY < minY) maxY = minY;
+    x = MAX(minX, MIN(maxX, x));
+    y = MAX(minY, MIN(maxY, y));
+
+    return CGRectMake(x, y, size.width, size.height);
+}
+
 static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
     NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
     if (!frames.count) return frames;
@@ -193,22 +182,39 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
     return patched ?: frames;
 }
 
-/// 落地时记下 itemView 当时的绝对 frame（orig 会把它归一化成 order，所以要提前取）
 static void hook_moveDraggingRecord(id self, SEL _cmd, id record, NSInteger side, CGPoint center) {
-    CGRect captured = CGRectNull;
-    @try {
-        id view = [(SCFloatingDockRecord *)record itemView];
-        if (view) captured = [view frame];
-    } @catch (__unused NSException *e) {}
+    CGRect host = sc_hostBounds(self);
+    BOOL nearEdge = sc_isNearEdge(host, center);
+
+    if (nearEdge) {
+        // 贴边：清掉自由位置，让 orig 走原槽位吸附
+        objc_setAssociatedObject(record, &kFreeFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SC_LOG(@"drop near edge (side=%ld center=%@) -> snap to slot",
+               (long)side, NSStringFromCGPoint(center));
+    } else {
+        CGRect freeFrame = sc_freeFrameForRecord(record, center, host);
+        objc_setAssociatedObject(record, &kFreeFrameKey,
+                                 [NSValue valueWithCGRect:freeFrame],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SC_LOG(@"drop free (side=%ld center=%@ host=%@) -> free frame %@",
+               (long)side, NSStringFromCGPoint(center),
+               NSStringFromCGRect(host), NSStringFromCGRect(freeFrame));
+    }
 
     orig_moveDraggingRecord(self, _cmd, record, side, center);
+}
 
-    if (record && !CGRectIsNull(captured) && captured.size.width > 1) {
-        objc_setAssociatedObject(record, &kFreeFrameKey,
-                                 [NSValue valueWithCGRect:captured],
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        SC_LOG(@"remember free frame %@ for record %p", NSStringFromCGRect(captured), record);
+/// 落帧兜底：有自由 frame 就用自由 frame 覆盖传入帧
+static void hook_applyFrame(id self, SEL _cmd, CGRect frame, id record) {
+    NSValue *custom = objc_getAssociatedObject(record, &kFreeFrameKey);
+    if (custom) {
+        CGRect freeFrame = [custom CGRectValue];
+        SC_LOG(@"applyFrame free %@ (orig would be %@)",
+               NSStringFromCGRect(freeFrame), NSStringFromCGRect(frame));
+        orig_applyFrame(self, _cmd, freeFrame, record);
+        return;
     }
+    orig_applyFrame(self, _cmd, frame, record);
 }
 
 static Class sc_classRespondingTo(SEL sel) {
@@ -230,14 +236,7 @@ static Class sc_classRespondingTo(SEL sel) {
 #pragma mark - 主入口 hook
 
 static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
-#if SC_DOCK_MODE == 0
-    gInToolCall = YES;
-    gShrunk = NO;
-#endif
     BOOL result = orig_openFrontmostAsSplit(self, _cmd, rect);
-#if SC_DOCK_MODE == 0
-    gInToolCall = NO;
-#endif
     if (!result) return result;
 
     @autoreleasepool {
@@ -285,18 +284,6 @@ static void installHook(int attempt) {
                     (IMP)hook_openFrontmostAsSplit,
                     (IMP *)&orig_openFrontmostAsSplit);
 
-#if SC_DOCK_MODE == 0
-    MSHookMessageEx(cls,
-                    @selector(sc_defaultContainerFrameForReferenceSize:hostBounds:),
-                    (IMP)hook_defaultContainerFrame,
-                    (IMP *)&orig_defaultContainerFrame);
-    MSHookMessageEx(cls,
-                    @selector(sc_rememberedFrameForTargetIdentifier:hostLandscape:contentLandscape:referenceSize:fallback:),
-                    (IMP)hook_rememberedFrame,
-                    (IMP *)&orig_rememberedFrame);
-    SC_LOG(@"hooked (mode=0)");
-#endif
-
 #if SC_DOCK_MODE == 2
     MSHookMessageEx(dockCls,
                     @selector(sc_targetFramesForSide:),
@@ -306,7 +293,12 @@ static void installHook(int attempt) {
                     @selector(sc_moveDraggingRecord:toSide:center:),
                     (IMP)hook_moveDraggingRecord,
                     (IMP *)&orig_moveDraggingRecord);
-    SC_LOG(@"hooked (mode=2, dockClass=%s)", class_getName(dockCls));
+    MSHookMessageEx(dockCls,
+                    @selector(sc_applyFrame:toRecord:),
+                    (IMP)hook_applyFrame,
+                    (IMP *)&orig_applyFrame);
+    SC_LOG(@"hooked (mode=2, dockClass=%s, edgeInset=%.0f)",
+           class_getName(dockCls), SC_EDGE_SNAP_INSET);
 #endif
 
 #if SC_DOCK_MODE == 1
