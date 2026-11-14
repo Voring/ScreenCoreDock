@@ -6,15 +6,14 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+# 不再 cancel-in-progress：避免连续 push 把自己的构建取消掉
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-14
-    outputs:
-      result: ${{ job.status }}
 
     steps:
       - name: Checkout
@@ -22,46 +21,58 @@ jobs:
 
       - name: Diagnostics
         run: |
-          uname -a
-          sw_vers || true
-          xcodebuild -version || true
-          xcrun --sdk iphoneos --show-sdk-version || true
-          make --version | head -2
-          perl -v | head -2
+          set -o pipefail
+          {
+            echo "stage: diagnostics"
+            uname -a
+            sw_vers || true
+            xcodebuild -version || true
+            xcrun --sdk iphoneos --show-sdk-version || true
+            make --version | head -2
+            perl -v | head -2
+          } 2>&1 | tee build.log
 
       - name: Install ldid
         run: |
-          brew install ldid || brew install ProcursusTeam/ldid/ldid || true
-          which ldid && ldid -v || echo "ldid unavailable"
+          set -o pipefail
+          {
+            echo "stage: ldid"
+            brew install ldid || brew install ProcursusTeam/ldid/ldid || true
+            which ldid && ldid -v || echo "ldid unavailable"
+          } 2>&1 | tee -a build.log
 
       - name: Set up Theos
         run: |
-          set -euo pipefail
-          export THEOS="$RUNNER_TEMP/theos"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          git clone --recursive --depth=1 https://github.com/roothide/theos.git "$THEOS"
-          test -d "$THEOS/makefiles"
-
-          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          cd /tmp/sdks
-          SDK_DIR="$(git ls-tree -d --name-only HEAD | grep -E '^iPhoneOS16\.5' | head -1)"
-          test -n "$SDK_DIR" || { echo 'SDK dir not found'; git ls-tree -d --name-only HEAD; exit 1; }
-          echo "SDK_DIR=$SDK_DIR"
-          git sparse-checkout set "$SDK_DIR"
-          cp -R "$SDK_DIR" "$THEOS/sdks/"
-          ls -la "$THEOS/sdks"
+          set -o pipefail
+          {
+            echo "stage: theos-setup"
+            set -e
+            export THEOS="$RUNNER_TEMP/theos"
+            echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+            git clone --recursive --depth=1 https://github.com/roothide/theos.git "$THEOS"
+            test -d "$THEOS/makefiles"
+            git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+            cd /tmp/sdks
+            SDK_DIR="$(git ls-tree -d --name-only HEAD | grep -E '^iPhoneOS16\.5' | head -1)"
+            test -n "$SDK_DIR"
+            echo "SDK_DIR=$SDK_DIR"
+            git sparse-checkout set "$SDK_DIR"
+            cp -R "$SDK_DIR" "$THEOS/sdks/"
+            ls -la "$THEOS/sdks"
+          } 2>&1 | tee -a build.log
 
       - name: Build (roothide)
         run: |
           set -o pipefail
-          export THEOS_PACKAGE_SCHEME=roothide
-          { echo "=== xcodebuild ==="; xcodebuild -version || true;
-            echo "=== env ==="; env | grep -E 'THEOS|SCHEME|GITHUB_SHA' || true;
-            echo "=== make clean ==="; make clean || true;
-            echo "=== make package ==="; make package FINALPACKAGE=1;
-            echo "=== packages ==="; ls -lh packages/ || true;
-          } 2>&1 | tee build.log
-          ls -lh packages/
+          {
+            echo "stage: make-package"
+            set -e
+            export THEOS_PACKAGE_SCHEME=roothide
+            echo "THEOS=$THEOS"
+            make clean || true
+            make package FINALPACKAGE=1
+            ls -lh packages/ || true
+          } 2>&1 | tee -a build.log
 
       - name: Upload deb
         if: success()
@@ -121,7 +132,7 @@ jobs:
             if [ -f /tmp/log/build.log ]; then
               tail -n 500 /tmp/log/build.log
             else
-              echo 'build.log 未上传（可能 job 在建 log 前就失败，例如 runner 获取失败）'
+              echo 'build.log 未上传（job 可能在建 log 前就失败，例如 runner 获取失败）'
             fi
             echo '```'
           } > ci/last-build.md
@@ -155,9 +166,6 @@ jobs:
           merge-multiple: true
           pattern: ScreenCoreDock-*
 
-      - name: Show artifacts
-        run: ls -lhR artifacts
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,7 +174,7 @@ jobs:
           VERSION=$(grep -m1 '^Version:' control | awk '{print $2}')
           TAG="v${VERSION}"
           echo "releasing $TAG"
-          ls artifacts/*.deb
+          ls -lh artifacts
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --target "$GITHUB_SHA" --title "ScreenCoreDock $TAG" --notes-file RELEASE_NOTES.md --latest
           gh release upload "$TAG" artifacts/*.deb --clobber
