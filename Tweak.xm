@@ -5,7 +5,7 @@
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
 //  (system-tool:fullscreen-to-screencore-split) 的产物，改造成「侧贴小卡片浮窗」。
 //
-//  交互规则（本版 v0.1.3）：
+//  交互规则（本版 v0.1.4）：
 //    - 松手位置贴近左/右边缘  -> 清除自由位置，回到插件原本的侧贴槽位吸附逻辑；
 //    - 松手位置偏离两侧边缘  -> 停在当前位置，任意摆放，不再回槽位。
 //
@@ -17,15 +17,16 @@
 //                -> -sc_applyFrame:toRecord: 逐个应用
 //    所以卡片坐标 = f(side, order)，松手必回槽位。
 //
-//  本版补丁点：
+//  本版补丁点（v0.1.4）：
 //    1) -sc_moveDraggingRecord:toSide:center:
 //         用传入的 center（hostRootView 坐标系）判断是否贴边；
-//         贴边 -> 清掉关联的自由 frame；偏离 -> 以落点 center + record.normalFrame 尺寸
-//         构造自由 frame，存到 record 的关联对象。
+//         贴边 -> 清掉关联的自由中心；偏离 -> 记下落点中心。
 //    2) -sc_targetFramesForSide:
-//         槽位表里「有自由 frame」的 record，槽位换成自由 frame。
+//         槽位表里「有自由中心」的 record，把槽位平移到该中心（尺寸沿用槽位尺寸）。
 //    3) -sc_applyFrame:toRecord:
-//         真正落帧前再兜底一次：有自由 frame 就用自由 frame 覆盖传入帧。
+//         落帧前再兜底一次：只平移，不改尺寸。
+//     为什么要锁尺寸：sc_applyFrame: 内部会调 sc_dockTransformForRecord:targetFrame:，
+//     它按「目标帧尺寸 / normalFrame 尺寸」算缩放。尺寸一旦被我们改大，卡片就会被放大数倍。
 //
 //  逆向依据（ScreenCore.dylib 2.0.5 arm64 切片，未滑动虚拟地址）：
 //    _SCFullscreenToSplitToolPerform                    0x113a4
@@ -33,7 +34,7 @@
 //    frame: -sc_rememberedFrameForTargetIdentifier:... 0x43f1c / -sc_defaultContainerFrame... 0x43c1c
 //    dock : -sc_dockSession:fromCorner: 0x463ac
 //    布局: -sc_targetFramesForSide: 0x3a384 / -sc_layoutSide:animated:completion: 0x3b1fc
-//          -sc_applyFrame:toRecord: 0x3ac70
+//          -sc_applyFrame:toRecord: 0x3ac70 / -sc_dockTransformForRecord:targetFrame: 0x3ab14
 //          -sc_moveDraggingRecord:toSide:center: 0x3e5e4
 //          -sc_dockedFloatingItemView:didMoveToCenter:state:velocity: 0x3f200
 //
@@ -67,7 +68,6 @@
 - (id)itemView;
 - (id)session;
 - (NSInteger)side;
-- (CGRect)normalFrame;
 @end
 
 @interface SCFloatingDockManager : NSObject
@@ -114,7 +114,9 @@ static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
 static void (*orig_moveDraggingRecord)(id, SEL, id, NSInteger, CGPoint);
 static void (*orig_applyFrame)(id, SEL, CGRect, id);
 
-static char kFreeFrameKey;   // record -> NSValue(CGRect)：用户摆的绝对位置（hostRootView 坐标系）
+// 只记「用户希望的卡片中心点」。尺寸永远沿用插件给的槽位尺寸，
+// 否则 sc_dockTransformForRecord:targetFrame: 会按尺寸比算缩放，把卡片放大。
+static char kFreeCenterKey;   // record -> NSValue(CGPoint)，hostRootView 坐标系
 
 static CGRect sc_hostBounds(id manager) {
     CGRect host = CGRectNull;
@@ -132,38 +134,32 @@ static BOOL sc_isNearEdge(CGRect host, CGPoint center) {
            center.x >= CGRectGetMaxX(host) - inset;
 }
 
-/// 以落点 center 为中心、record 现有尺寸构造自由帧，并夹在 host 范围内
-static CGRect sc_freeFrameForRecord(id record, CGPoint center, CGRect host) {
-    CGRect nf = [record normalFrame];
-    CGSize size = nf.size;
-    if (size.width < 1 || size.height < 1) {
-        @try {
-            id view = [(SCFloatingDockRecord *)record itemView];
-            if (view) size = [view frame].size;
-        } @catch (__unused NSException *e) {}
-    }
-    if (size.width < 1) size.width = 200.0;
-    if (size.height < 1) size.height = 300.0;
-
-    CGFloat x = center.x - size.width / 2.0;
-    CGFloat y = center.y - size.height / 2.0;
-
-    CGFloat minX = CGRectGetMinX(host);
-    CGFloat maxX = CGRectGetMaxX(host) - size.width;
-    CGFloat minY = CGRectGetMinY(host);
-    CGFloat maxY = CGRectGetMaxY(host) - size.height;
+/// 把中心点夹到 host 内（保证整张卡片不越界）
+static CGPoint sc_clampCenter(CGPoint center, CGSize size, CGRect host) {
+    CGFloat halfW = size.width / 2.0;
+    CGFloat halfH = size.height / 2.0;
+    CGFloat minX = CGRectGetMinX(host) + halfW;
+    CGFloat maxX = CGRectGetMaxX(host) - halfW;
+    CGFloat minY = CGRectGetMinY(host) + halfH;
+    CGFloat maxY = CGRectGetMaxY(host) - halfH;
     if (maxX < minX) maxX = minX;
     if (maxY < minY) maxY = minY;
-    x = MAX(minX, MIN(maxX, x));
-    y = MAX(minY, MIN(maxY, y));
+    center.x = MAX(minX, MIN(maxX, center.x));
+    center.y = MAX(minY, MIN(maxY, center.y));
+    return center;
+}
 
-    return CGRectMake(x, y, size.width, size.height);
+static CGRect sc_rectCenteredAt(CGPoint center, CGSize size) {
+    return CGRectMake(center.x - size.width / 2.0,
+                      center.y - size.height / 2.0,
+                      size.width, size.height);
 }
 
 static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
     NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
     if (!frames.count) return frames;
 
+    CGRect host = sc_hostBounds(self);
     NSMutableDictionary *patched = nil;
     for (id key in [frames allKeys]) {
         id record = nil;
@@ -172,12 +168,18 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
         }
         if (!record) record = key;
 
-        NSValue *custom = objc_getAssociatedObject(record, &kFreeFrameKey);
+        NSValue *custom = objc_getAssociatedObject(record, &kFreeCenterKey);
         if (!custom) continue;
 
+        // 关键：尺寸用插件算好的槽位尺寸，只换位置
+        CGRect slot = [frames[key] CGRectValue];
+        CGPoint center = sc_clampCenter([custom CGPointValue], slot.size, host);
+        CGRect moved = sc_rectCenteredAt(center, slot.size);
+
         if (!patched) patched = [frames mutableCopy];
-        patched[key] = custom;
-        SC_LOG(@"free frame applied for record %p -> %@", record, NSStringFromCGRect([custom CGRectValue]));
+        patched[key] = [NSValue valueWithCGRect:moved];
+        SC_LOG(@"free center applied for record %p -> %@ (slot %@)",
+               record, NSStringFromCGRect(moved), NSStringFromCGRect(slot));
     }
     return patched ?: frames;
 }
@@ -188,30 +190,29 @@ static void hook_moveDraggingRecord(id self, SEL _cmd, id record, NSInteger side
 
     if (nearEdge) {
         // 贴边：清掉自由位置，让 orig 走原槽位吸附
-        objc_setAssociatedObject(record, &kFreeFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(record, &kFreeCenterKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         SC_LOG(@"drop near edge (side=%ld center=%@) -> snap to slot",
                (long)side, NSStringFromCGPoint(center));
     } else {
-        CGRect freeFrame = sc_freeFrameForRecord(record, center, host);
-        objc_setAssociatedObject(record, &kFreeFrameKey,
-                                 [NSValue valueWithCGRect:freeFrame],
+        objc_setAssociatedObject(record, &kFreeCenterKey,
+                                 [NSValue valueWithCGPoint:center],
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        SC_LOG(@"drop free (side=%ld center=%@ host=%@) -> free frame %@",
-               (long)side, NSStringFromCGPoint(center),
-               NSStringFromCGRect(host), NSStringFromCGRect(freeFrame));
+        SC_LOG(@"drop free (side=%ld center=%@ host=%@)",
+               (long)side, NSStringFromCGPoint(center), NSStringFromCGRect(host));
     }
 
     orig_moveDraggingRecord(self, _cmd, record, side, center);
 }
 
-/// 落帧兜底：有自由 frame 就用自由 frame 覆盖传入帧
+/// 落帧兜底：只平移，不改尺寸
 static void hook_applyFrame(id self, SEL _cmd, CGRect frame, id record) {
-    NSValue *custom = objc_getAssociatedObject(record, &kFreeFrameKey);
+    NSValue *custom = objc_getAssociatedObject(record, &kFreeCenterKey);
     if (custom) {
-        CGRect freeFrame = [custom CGRectValue];
-        SC_LOG(@"applyFrame free %@ (orig would be %@)",
-               NSStringFromCGRect(freeFrame), NSStringFromCGRect(frame));
-        orig_applyFrame(self, _cmd, freeFrame, record);
+        CGRect host = sc_hostBounds(self);
+        CGPoint center = sc_clampCenter([custom CGPointValue], frame.size, host);
+        CGRect moved = sc_rectCenteredAt(center, frame.size);
+        SC_LOG(@"applyFrame moved %@ -> %@", NSStringFromCGRect(frame), NSStringFromCGRect(moved));
+        orig_applyFrame(self, _cmd, moved, record);
         return;
     }
     orig_applyFrame(self, _cmd, frame, record);
