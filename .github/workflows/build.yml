@@ -1,10 +1,9 @@
-name: Build & Release
+name: Build (roothide)
 
 on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -13,56 +12,84 @@ concurrency:
 
 jobs:
   build:
-    name: build (${{ matrix.scheme }})
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        scheme: [ rootless, roothide ]
+    runs-on: macos-14
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Diagnostics
+        run: |
+          uname -a
+          sw_vers || true
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          make --version | head -2
+          perl -v | head -2
+
       - name: Install ldid
         run: |
-          brew install ldid || true
-          which ldid || echo "ldid not found, will rely on Theos fallback"
+          brew install ldid || brew install ProcursusTeam/ldid/ldid || true
+          which ldid && ldid -v || echo "ldid unavailable (will see if Theos needs it)"
 
       - name: Set up Theos
         run: |
-          set -e
+          set -euo pipefail
           export THEOS="$RUNNER_TEMP/theos"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           git clone --recursive --depth=1 https://github.com/roothide/theos.git "$THEOS"
-          mkdir -p "$THEOS/sdks"
+          test -d "$THEOS/makefiles" && echo "makefiles ok"
+          test -d "$THEOS/vendor" || true
 
-          # 只取 iOS 16.5 SDK，避免整包 sdks 仓库
+          # 只取 iOS 16.5 SDK（theos/sdks 仓库很大，用 partial clone）
           git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
           cd /tmp/sdks
-          SDK_DIR=$(git ls-tree -d --name-only HEAD | grep -E 'iPhoneOS16\.5' | head -1)
+          git ls-tree -d --name-only HEAD | sort | head -30
+          SDK_DIR="$(git ls-tree -d --name-only HEAD | grep -E '^iPhoneOS16\.5' | head -1)"
+          test -n "$SDK_DIR" || { echo 'SDK dir not found'; exit 1; }
           echo "SDK_DIR=$SDK_DIR"
           git sparse-checkout set "$SDK_DIR"
           cp -R "$SDK_DIR" "$THEOS/sdks/"
-          ls "$THEOS/sdks"
+          ls -la "$THEOS/sdks"
+          test -f "$THEOS/sdks/$SDK_DIR/SDKSettings.plist" && echo "SDK ok"
 
-      - name: Build
+      - name: Build (roothide)
         run: |
-          set -e
-          export THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
-          make clean || true
-          make package FINALPACKAGE=1
-          ls -l packages/
+          set -o pipefail
+          export THEOS_PACKAGE_SCHEME=roothide
+          make clean 2>&1 | tee build.log || true
+          make package FINALPACKAGE=1 2>&1 | tee -a build.log
+          ls -lh packages/
 
-      - name: Upload deb artifact
+      - name: Upload deb
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: deb-${{ matrix.scheme }}
+          name: ScreenCoreDock-roothide
           path: packages/*.deb
-          if-no-files-found: error
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+
+      - name: Dump failure summary
+        if: failure()
+        run: |
+          {
+            echo '## Build failed'
+            echo '```'
+            tail -n 60 build.log 2>/dev/null || echo 'no build.log'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
-    name: release
     needs: build
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
@@ -78,6 +105,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          pattern: ScreenCoreDock-*
 
       - name: Show artifacts
         run: ls -lhR artifacts
@@ -86,12 +114,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           VERSION=$(grep -m1 '^Version:' control | awk '{print $2}')
           TAG="v${VERSION}"
           echo "releasing $TAG"
+          ls artifacts/*.deb
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --target "$GITHUB_SHA" --title "ScreenCoreDock $TAG" --notes-file RELEASE_NOTES.md --latest
           gh release upload "$TAG" artifacts/*.deb --clobber
           gh release edit "$TAG" --title "ScreenCoreDock $TAG" --notes-file RELEASE_NOTES.md --latest
-          gh release view "$TAG" --json tagName,assets
