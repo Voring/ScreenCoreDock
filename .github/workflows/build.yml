@@ -6,31 +6,40 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
-# 不再 cancel-in-progress：避免连续 push 把自己的构建取消掉
 concurrency:
   group: build-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 已进入淘汰周期，改用 macos-15（arm64）
+    runs-on: macos-15
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Runner probe
+        run: |
+          set -o pipefail
+          {
+            echo "stage: probe"
+            echo "runner-os: $RUNNER_OS / $RUNNER_ARCH"
+            uname -a
+            sw_vers || true
+          } 2>&1 | tee build.log
 
       - name: Diagnostics
         run: |
           set -o pipefail
           {
             echo "stage: diagnostics"
-            uname -a
-            sw_vers || true
             xcodebuild -version || true
             xcrun --sdk iphoneos --show-sdk-version || true
             make --version | head -2
             perl -v | head -2
-          } 2>&1 | tee build.log
+          } 2>&1 | tee -a build.log
 
       - name: Install ldid
         run: |
