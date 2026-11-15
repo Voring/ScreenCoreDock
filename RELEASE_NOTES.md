@@ -1,68 +1,48 @@
-# ScreenCoreDock v0.3.3
+# ScreenCoreDock v0.3.4
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.3`
+- 版本：`0.3.4`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## v0.3.2 日志结论
+## 崩溃原因
 
-v0.3.2 真机日志（`/var/mobile/Library/Logs/ScreenCoreDock.log`）：
-
-- 三次 `v0.3.2 loaded`，hook 全部挂上；
-- 只有 `sc_closeSession:animated: called (coverSheet=0)`，没有任何 `undockSession` / `restoreAllDocked` / `restoreRecordToNormalFrame` 记录；
-- `coverSheet` 恒为 0。说明两个问题：
-  1. 我们当初写的 `isCoverSheetPresented` getter 很可能在这个类上不存在（或 `sharedInstance` 取不到），状态探测一直返回 NO；
-  2. 通知中心收回侧贴到底走哪条入口，现有日志还不能定论，需要把拦截点再铺开。
-
-## 本版改动
-
-### 1. CoverSheet 状态探测补全
-
-缓存 `SBCoverSheetPresentationManager` 实例，依次尝试四个 getter：
+v0.3.3 装上后进安全模式，真机 ips（`SpringBoard-2026-11-15-191559.ips`）崩溃栈：
 
 ```
-isCoverSheetPresented / coverSheetPresented / isPresented / presented
++[SBCoverSheetPresentationManager sharedInstance]
+  __49+[SBCoverSheetPresentationManager sharedInstance]_block_invoke
+-[SBCoverSheetPresentationManager init]
+-[SBCoverSheetPresentationManager _newRubberBandFeedbackGeneratorForSettings:]
+std::terminate() / abort()  SIGABRT
 ```
 
-启动时把探测结果写进日志，方便确认类、实例、getter 是否存在：
+我们在启动 hook 阶段（`%ctor` 后立刻）就调了 `sharedInstance`。这个单例的 `init` 里要建震动反馈生成器，启动早期环境未就绪，直接 `abort()`；`@try/@catch` 拦不住 SIGABRT。
+
+## 本版修复
+
+- 启动时只 `objc_getClass` 看类是否存在，**不碰 `sharedInstance`**；
+- `sharedInstance` 延迟 5 秒后才在主队列懒加载，之后 hook 触发时才查询 CoverSheet 状态；
+- 其它回收拦截点（undock / restoreAll / closeSession / closeAll / restoreRecord 日志）保留。
+
+## 启动后日志预期
 
 ```
+v0.3.4 loaded in SpringBoard
+hooked sc_undockSession:animated: ...
 coverSheet class=SBCoverSheetPresentationManager
-coverSheet manager=SBCoverSheetPresentationManager
-coverSheet getter isCoverSheetPresented responds=0 value=-1
-coverSheet getter coverSheetPresented responds=0 value=-1
-coverSheet getter isPresented responds=1 value=0
-coverSheet getter presented responds=1 value=0
+...（5 秒后）
+coverSheet manager=...
+coverSheet getter isCoverSheetPresented responds=...
+coverSheet getter coverSheetPresented responds=...
+coverSheet getter isPresented responds=...
+coverSheet getter presented responds=...
 ```
 
-### 2. 扩充回收拦截点
-
-| 方法 | 类 | 行为 |
-|---|---|---|
-| `sc_undockSession:animated:` | DockManager | CoverSheet 展示时跳过 |
-| `sc_restoreAllDockedSessionsAnimated:` | DockManager | CoverSheet 展示时跳过 |
-| `sc_closeSession:animated:` | SceneManager | CoverSheet 展示时跳过（v0.3.2 只记日志，本版拦截） |
-| `sc_closeAllSessions` | SceneManager | CoverSheet 展示时跳过 |
-| `sc_restoreRecordToNormalFrame:animated:completion:` | DockManager | 只记日志，不改行为 |
-
-### 3. 下次需要回传的日志
-
-安装后：
-
-1. 重启 SpringBoard，看启动段 `coverSheet class/manager/getter` 四行；
-2. 贴好侧贴，下拉一次通知中心，再收起；
-3. 把整份 `ScreenCoreDock.log` 回传。
-
-判断依据：
-
-- `coverSheet manager=nil` -> 类名或 `sharedInstance` 不对，需要换状态来源；
-- 四个 getter `responds=0` -> 这个类的属性名要再反查；
-- 下拉后出现 `skip closeSession` / `skip closeAllSessions` -> 拦截生效；
-- 四个入口都没出现新日志，但卡片还是消失 -> 走的是场景层隐藏（不在这五个方法里），再查 `sc_floatingDockManager:willDismissSession:` 或场景投递路径。
+若 `coverSheet manager=nil` 或四个 getter 全 `responds=0`，把这段日志回传，再换状态来源。
 
 ## 保留的既有改动
 
