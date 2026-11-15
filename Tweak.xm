@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.0
+//  ScreenCoreDock  v0.3.1
 //
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
 //  (system-tool:fullscreen-to-screencore-split)
@@ -15,14 +15,17 @@
 //    v0.1.9  转横屏时 -sc_restoreAllDockedSessionsAnimated:（0x42ca8 尾部 0x42ee0）
 //            不再把所有已侧贴的 session 强制收回；
 //    v0.2.0  横屏卡片过大 -> 按 0.5 缩放 + 自上而下紧凑重排（LandscapeDockScale）；
-//    v0.2.1  横屏左右间距对齐（左侧照抄右侧那个视觉间距）；
+//    v0.2.1  横屏左右间距对齐；
 //    v0.2.3  横屏顶部间距缩到 1/4。
 //
-//  v0.3.0 移除（按需求推翻，永不再装）：
+//  v0.3.0 移除（四角点击方案彻底推翻）：
 //    - 浮窗四角的一切监听器：原 sc_handleDockTap: hook、自建 UITapGestureRecognizer、
 //      sc_layoutExternalInteractionRegions 诊断 hook；
 //    - 所有「横屏点角转侧贴」的兜底链路（delegate 转发 / session 兜底 / activeSession 兜底）。
-//    横屏下已存在的侧贴保持不动，位置也按上面的间距规则；但点四角不再有任何行为。
+//
+//  v0.3.1 新需求：浮窗左侧手势区（区域 accessibilityIdentifier 为
+//    "ScreenCore.Split.LeftMoveFullscreen"）原本绑的是 sc_handleFullscreenTap:（转全屏），
+//    改为与右侧/下侧一致 -> sc_handleCloseTap:（关闭浮窗）。顶部区域不动，仍为全屏。
 //
 
 #import <Foundation/Foundation.h>
@@ -82,6 +85,14 @@ static void SCLogAppend(NSString *msg) {
 - (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
 @end
 
+// 左侧手势区改关闭：两个 tapAction 在 0x34628 安装区域时绑定
+//   Top / Left    -> 0xab090 -> sc_handleFullscreenTap:（0x385b8）
+//   Bottom / Right -> 0xab098 -> sc_handleCloseTap:（0x3853c）
+@interface SCFloatingContainerView : NSObject
+- (void)sc_handleFullscreenTap:(id)gesture;
+- (void)sc_handleCloseTap:(id)gesture;
+@end
+
 @interface SCFloatingDockManager : NSObject
 - (NSInteger)hostOrientation;
 - (UIView *)hostRootView;
@@ -97,6 +108,7 @@ static NSInteger (*orig_activeHostOrientation)(id, SEL);
 static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
 static void (*orig_restoreAllDocked)(id, SEL, BOOL);
 static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
+static void (*orig_handleFullscreenTap)(id, SEL, id);
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
@@ -156,6 +168,26 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
         SC_LOG(@"landscape dock fallback via dockManager ok=%d", ok);
     }
     return ok;
+}
+
+#pragma mark - 左侧手势区改为关闭浮窗（v0.3.1）
+
+static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
+    UIView *region = nil;
+    @try { region = [gesture view]; }
+    @catch (__unused NSException *e) {}
+
+    NSString *ident = nil;
+    @try { ident = [region accessibilityIdentifier]; }
+    @catch (__unused NSException *e) {}
+
+    if (ident && [ident isEqualToString:@"ScreenCore.Split.LeftMoveFullscreen"]) {
+        SC_LOG(@"left gesture region tapped, close floating window instead of fullscreen");
+        [(SCFloatingContainerView *)self sc_handleCloseTap:gesture];
+        return;
+    }
+
+    if (orig_handleFullscreenTap) orig_handleFullscreenTap(self, _cmd, gesture);
 }
 
 #pragma mark - 横屏不强制收回侧贴（v0.1.9）+ 横屏重排
@@ -366,6 +398,19 @@ static void installHook(int attempt) {
                         (IMP *)&orig_orientationDidChange);
     }
 
+    Class containerCls = objc_getClass("SCFloatingContainerView");
+    if (containerCls &&
+        [containerCls instancesRespondToSelector:@selector(sc_handleFullscreenTap:)] &&
+        [containerCls instancesRespondToSelector:@selector(sc_handleCloseTap:)]) {
+        MSHookMessageEx(containerCls,
+                        @selector(sc_handleFullscreenTap:),
+                        (IMP)hook_handleFullscreenTap,
+                        (IMP *)&orig_handleFullscreenTap);
+        SC_LOG(@"hooked sc_handleFullscreenTap: (left region -> close)");
+    } else {
+        SC_LOG(@"sc_handleFullscreenTap: hook skipped");
+    }
+
     Class dockCls = objc_getClass("SCFloatingDockManager");
     if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_targetFramesForSide:)]) {
         MSHookMessageEx(dockCls,
@@ -380,12 +425,12 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames), corner listeners removed");
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose)");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.0 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.1 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
