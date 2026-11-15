@@ -41,6 +41,14 @@ jobs:
             perl -v | head -2
           } 2>&1 | tee -a build.log
 
+      - name: Show package metadata
+        run: |
+          set -o pipefail
+          {
+            echo "stage: metadata"
+            grep -E '^(Package|Name|Version|Architecture|Depends):' control || true
+          } 2>&1 | tee -a build.log
+
       - name: Install ldid
         run: |
           set -o pipefail
@@ -89,7 +97,7 @@ jobs:
         with:
           name: ScreenCoreDock-roothide
           path: packages/*.deb
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Upload build log
         if: always()
