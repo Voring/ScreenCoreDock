@@ -1,16 +1,16 @@
-# ScreenCoreDock v0.2.0
+# ScreenCoreDock v0.2.1
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.2.0`
+- 版本：`0.2.1`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
 ## 改动说明
 
-逻辑仍是 **v0.1.0 基线**（打开分屏 -> 补一次 dock），叠加横屏相关的三项放开与一项尺寸修正。
+逻辑仍是 **v0.1.0 基线**（打开分屏 -> 补一次 dock），叠加横屏相关的四项放开与两项几何修正。
 
 ### 横屏限制一（v0.1.8 已解）
 
@@ -24,7 +24,29 @@
 
 修法：方向切换期间打标记，hook `-sc_restoreAllDockedSessionsAnimated:`，标记为真且 `hostOrientation >= 3` 时跳过。
 
-### 横屏卡片过大（本版 v0.2.0 修）
+### 横屏点四角不进侧贴（本版 v0.2.1 修）
+
+**根因**：`-sc_handleDockTap:`（0x386b0）在 0x38738 处比较容器 bounds：
+
+```
+0x38730  bl    bounds
+0x38734  bl    CGRectGetHeight
+0x38738  fcmp  d8, d0        ; 宽 vs 高
+0x3873c  b.le  -> 0x38760    ; 竖屏才继续
+0x38740  ...   -> 0x387d0    ; 宽 > 高（横屏）直接返回，不发 dock 请求
+```
+
+所以横屏下点浮窗四个角没有反应；能侧贴只是因为 v0.1.9 保住了「竖屏贴好再转横屏」的记录。
+
+**修法**：hook 该视图的 `-sc_handleDockTap:`（按选择器找到同时实现 `sc_handleDockTap:` 与 `cornerResizeTouchRegions` 的类），竖屏照原方法走；横屏且未 docked 时，复刻原方法末尾那一步：
+
+```
+[[self delegate] sc_floatingContainerView:self didRequestDockFromCorner:[[gesture view] tag]]
+```
+
+后续仍走已 hook 的 `-sc_dockSession:fromCorner:`，于是横屏直接点角就能落成侧贴。
+
+### 横屏卡片过大（v0.2.0 修）
 
 **根因**：`-sc_targetFramesForSide:`（0x3a384）算尺寸时
 
@@ -36,7 +58,7 @@
 **修法**：hook `SCFloatingDockManager -sc_targetFramesForSide:`，仅当 `hostOrientation >= 3` 时：
 
 1. 每张卡的宽、高各乘 `scale`（默认 0.5，即面积 1/4）；
-2. 用重算后的高度自上而下重新紧凑堆叠（gap = 18 × scale），x 沿用插件算好的贴边位置；
+2. 用重算后的高度自上而下重新紧凑堆叠（gap = 18 × scale）；
 3. 超出屏幕高度时向上夹紧；
 4. 竖屏完全走原逻辑，不干预。
 
@@ -46,7 +68,21 @@
 defaults write com.voring.screencoredock LandscapeDockScale -float 0.5
 ```
 
-另外，转进横屏后会延时 0.1s 对左右两侧各调一次 `-sc_layoutSide:animated:completion:`，确保缩放后的帧真正落地（否则容器帧可能停留在旋转前的整屏尺寸）。
+另外，转进横屏后会延时 0.1s 对左右两侧各调一次 `-sc_layoutSide:animated:completion:`，确保缩放后的帧真正落地。
+
+### 横屏侧贴四向边距不一致（本版 v0.2.1 修）
+
+左右边距在插件里本来就是同一个常量 **8pt**（0x3aaec 的 `-8`、0x3aaf8 的 `+8`）；顶部用的是 `_SCFloatingPortraitTopInset`（0x33c98），而该函数在横屏（bounds 宽 > 高）时返回 **0**，所以顶部贴边。
+
+右侧看着离得远，是 v0.2.0 的问题：缩尺寸时只重算了宽高、没重算右侧 x，右侧卡的 x 仍停在旧左边界，缩掉的一半宽度全变成右侧空隙（`8 + 0.5×旧宽 ≈ 90`，正好接近竖屏状态栏高度）。
+
+**修法**：横屏重排时按插件原常量统一四向边距为 8pt：
+
+- 左：`x = minX + 8`
+- 右：`x = maxX - 8 - 新宽`
+- 顶：`y = minY + 8`
+
+不新增任何判定或参数。
 
 ## 真机验证
 
@@ -56,7 +92,8 @@ log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'
 
 - 横屏后应看到 `landscape frames side=1 scale=0.50 ... -> ...`，对比前后尺寸应约为一半；
 - 以及 `landscape relayout done`；
-- 竖屏不应出现 `landscape frames` 这行。
+- 横屏点四角应看到 `landscape dock tap corner=N, forward to sceneManager`，随后 `dock corner=... ok=1`；
+- 竖屏不应出现 `landscape frames` / `landscape dock tap` 这些行。
 
 若尺寸仍偏大/偏小，直接改 `LandscapeDockScale`（0.2~1.0）即可，无需重编。
 
@@ -71,5 +108,8 @@ log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'
 | `0x3d13c` | `-sc_restoreAllDockedSessionsAnimated:` |
 | `0x3a384` | `-sc_targetFramesForSide:`（宽度 0.23×hostW / 高度按 normalFrame 比例） |
 | `0x3b1fc` | `-sc_layoutSide:animated:completion:` |
-| `0x3ab14` | `-sc_dockTransformForRecord:targetFrame:`（缩放 = min(目标宽/原宽, 目标高/原高)） |
+| `0x3ab14` | `-sc_dockTransformForRecord:targetFrame:` |
 | `0x3fb28` | `-hostOrientation` |
+| `0x386b0` | `-sc_handleDockTap:`（横屏 0x38738 宽>高直接 return） |
+| `0x4931c` | `-sc_floatingContainerView:didRequestDockFromCorner:` |
+| `0x33c98` | `_SCFloatingPortraitTopInset`（横屏返回 0） |
