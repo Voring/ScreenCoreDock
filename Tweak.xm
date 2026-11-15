@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.1.8
+//  ScreenCoreDock  v0.1.9
 //
 //  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
 //  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
@@ -17,7 +17,23 @@
 //  这条链路里没有任何 dock 调用，所以窗口必定是「分屏浮窗」。
 //  本 tweak 在原方法返回后取 activeSession 补一次 dock，使其落成「侧贴浮窗」。
 //
-//  v0.1.8 唯一新增：横屏修复
+//  v0.1.8：横屏修复（放开 sc_dockSession:fromCorner: 的方向守卫）
+//  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
+//
+//    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
+//
+//        0x42ec0  cmp   x26, #1          ; x26 = 新方向 - 3
+//        0x42ec4  b.hi  0x42eec          ; 非横屏跳过
+//        0x42ee0  bl    sc_restoreAllDockedSessionsAnimated:   ; 横屏 -> 全部收回
+//
+//    也就是只要方向变成横屏(3/4)，dockManager 会把所有已侧贴的 session 全部
+//    restore 回普通浮窗，结果就是「横屏不允许悬挂侧贴」。
+//    v0.1.9 的修法：hook SCFloatingSceneManager -sc_activeHostOrientationDidChange:duration:
+//    打一个「方向切换进行中」标记，再 hook SCFloatingDockManager
+//    -sc_restoreAllDockedSessionsAnimated:，当标记为真且 hostOrientation >= 3 时放行保留。
+//    手动「全部收回」等其它调用不在此期间，照常执行。
+//
+//  v0.1.8 细节：
 //
 //    -[SCFloatingSceneManager sc_dockSession:fromCorner:]（0x463ac）进函数后立刻
 //    校验 host 方向：
@@ -61,16 +77,26 @@
 - (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
 @end
 
+@interface SCFloatingSceneManager (Orientation)
+- (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
+@end
+
 @interface SCFloatingDockManager : NSObject
 - (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
+- (NSInteger)hostOrientation;
+- (void)sc_restoreAllDockedSessionsAnimated:(BOOL)animated;
 @end
 
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
 static BOOL (*orig_dockSession)(id, SEL, id, NSInteger);
 static NSInteger (*orig_activeHostOrientation)(id, SEL);
+static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
+static void (*orig_restoreAllDocked)(id, SEL, BOOL);
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
+// 只在插件处理方向切换期间为 YES
+static BOOL sc_inOrientationChange = NO;
 
 static NSInteger sc_defaultDockCorner(void) {
     NSNumber *side = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
@@ -126,6 +152,37 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
         SC_LOG(@"landscape dock fallback via dockManager ok=%d", ok);
     }
     return ok;
+}
+
+#pragma mark - 横屏保留侧贴
+
+// 方向切换期间打标记，供 restoreAll 判断是不是「转入横屏」触发的强制收回
+static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, double duration) {
+    sc_inOrientationChange = YES;
+    @try {
+        orig_orientationDidChange(self, _cmd, orientation, duration);
+    } @finally {
+        sc_inOrientationChange = NO;
+    }
+    SC_LOG(@"orientation change -> %ld done", (long)orientation);
+}
+
+// 插件在转入横屏时会调它把全部侧贴收回（0x42ec0/0x42ee0），这里放行保留
+static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
+    if (sc_inOrientationChange) {
+        NSInteger host = 0;
+        @try {
+            if ([self respondsToSelector:@selector(hostOrientation)]) {
+                host = [(SCFloatingDockManager *)self hostOrientation];
+            }
+        } @catch (__unused NSException *e) {}
+
+        if (host >= 3) {
+            SC_LOG(@"landscape entry: keep docked records (skip restoreAllDockedSessionsAnimated:)");
+            return;
+        }
+    }
+    orig_restoreAllDocked(self, _cmd, animated);
 }
 
 #pragma mark - 入口
@@ -201,7 +258,23 @@ static void installHook(int attempt) {
                         (IMP *)&orig_activeHostOrientation);
     }
 
-    SC_LOG(@"hooked (open + dockSession + activeHostOrientation)");
+    // 转入横屏时插件会强制收回全部侧贴，挂方向切换入口和收回方法
+    if ([cls instancesRespondToSelector:@selector(sc_activeHostOrientationDidChange:duration:)]) {
+        MSHookMessageEx(cls,
+                        @selector(sc_activeHostOrientationDidChange:duration:),
+                        (IMP)hook_orientationDidChange,
+                        (IMP *)&orig_orientationDidChange);
+    }
+
+    Class dockCls = objc_getClass("SCFloatingDockManager");
+    if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_restoreAllDockedSessionsAnimated:)]) {
+        MSHookMessageEx(dockCls,
+                        @selector(sc_restoreAllDockedSessionsAnimated:),
+                        (IMP)hook_restoreAllDocked,
+                        (IMP *)&orig_restoreAllDocked);
+    }
+
+    SC_LOG(@"hooked (open + dockSession + activeHostOrientation + orientationChange + restoreAllDocked)");
 }
 
 %ctor {
