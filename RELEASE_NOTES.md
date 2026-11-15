@@ -1,45 +1,38 @@
-# ScreenCoreDock v0.3.6
+# ScreenCoreDock v0.3.7
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.6`
+- 版本：`0.3.7`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## 本版改动：只清理，不改行为
+## 本版改动：修复 v0.3.5 引入的关闭/放大手势回归
 
-通知中心不收回侧贴已验证可用。本次把测试期间临时加的东西全删了，功能不变。
+### 问题
 
-### 删除内容
+v0.3.5 起：浮窗左/右/下侧点击不再关闭浮窗，点击侧贴也不再放大浮窗。
 
-| 删除项 | 原因 |
-| --- | --- |
-| `sc_dumpCoverSheetDiagnostics()` 与 5 秒后的窗口类名 dump | 纯诊断，用于校准窗口类名 |
-| `hook_restoreRecord`（restoreRecordToNormalFrame 只记日志） | 只记日志，无任何行为，验证已结束 |
-| `targetFramesForSide` 里逐张卡的 `landscape frames ... A -> B` | 每次重排刷屏，无诊断价值 |
-| `sc_closeSession` / `sc_closeAllSessions` / `undockSession` 里的 `notification center shown: skip ...` 日志 | 行为保留，日志删掉 |
-| 顶部大段版本演进注释（v0.1.x / v0.2.x 逐条历史） | 换成一句话功能清单 |
-| 接口声明里未使用的 `sc_restoreRecordToNormalFrame:animated:completion:` | 随 hook 一并移除 |
+### 原因
 
-### 保留内容（就是功能本体）
+通知中心在场判定遍历 `[UIApplication sharedApplication].windows` 时，把**收起后仍留在数组里的隐藏 CoverSheet 窗口**也算成在场，导致 `sc_closeSession:animated:` / `sc_undockSession:animated:` 等正常关闭、放大调用被无条件跳过。
 
-1. `sc_openFrontmostApplicationAsSplitFromSourceRect:` → 打开后补一次 dock；
-2. `sc_dockSession:fromCorner:` → 横屏被拒时临时顶竖屏重入，再兜底 DockManager；
-3. `activeHostOrientation` → 配合上面的临时覆盖；
-4. `sc_activeHostOrientationDidChange:duration:` → 转横屏后 0.1s 双侧 relayout；
-5. `sc_restoreAllDockedSessionsAnimated:` → 通知中心在场 / 转横屏时跳过；
-6. `sc_targetFramesForSide:` → 横屏 0.5 缩放 + 左右间距对齐 + 顶部 1/4 间距；
-7. `sc_handleFullscreenTap:` → 左手势区改为关闭浮窗；
-8. `sc_undockSession:animated:` / `sc_closeSession:animated:` / `sc_closeAllSessions` → 通知中心在场时跳过。
+### 修复
 
-### 剩余日志（只有失败/关键路径）
+- 窗口类名匹配前先跳过 `isHidden == YES` 的窗口；
+- 启动 0.5s 后打一条可见窗口清单（类名 / hidden / level），用于确认到底命中了哪个类。
+
+### 行为保持不变
+
+下拉通知中心时侧贴仍不被收回；横屏已侧贴应用不被强制下掉；横屏侧贴位置与 1/4 缩放保留；左侧手势区关闭浮窗。
+
+### 装完请回传
+
+日志路径：`/var/mobile/Library/Logs/ScreenCoreDock.log`（不可写则 `/tmp/ScreenCoreDock.log`），关注启动后那条：
 
 ```
-v0.3.6 loaded in SpringBoard
-hooked: open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet
-dock corner=1 ok=1
-landscape dock ok via forced-orientation retry
-sc_dockSession:fromCorner: threw ...
+visible windows: ...
 ```
+
+如果本版关闭/放大仍失效，把这一行连同复现步骤回传。
