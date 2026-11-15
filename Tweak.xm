@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.2.3
+//  ScreenCoreDock  v0.2.4
 //
 //  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
 //  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
@@ -22,7 +22,8 @@
 //  v0.2.0：横屏卡片过大，按 0.5 缩放并重排
 //  v0.2.1：横屏可点四角进侧贴；横屏左右间距对齐
 //  v0.2.2：修安全模式 —— 不再在初始化时遍历全类表，改为按类名取 SCFloatingContainerView
-//  v0.2.3：横屏点角补 session 兜底（转发无效时直接 sc_dockSession:）；顶部间距缩到 1/4
+//  v0.2.3：横屏点角补 session 兜底；顶部间距缩到 1/4
+//  v0.2.4：点角取 session 失败时再萺 activeSession，并把失败原因打出来
 //
 //    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
 //
@@ -285,7 +286,7 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
     if (keys.count == 0) return frames;
     CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
     // 横屏下保持右侧那个视觉间距（8 + 缩掉的一半宽度），左侧照抄同一值。
-    // 顶部只取该间距叠加状态栏高度的 1/4（v0.2.3 按反馈缩短），不再留整段。
+    // 顶部只取该间距叠加状态栏高度的 1/4（v0.2.3 按反馈缩短）。
     CGFloat margin = 8.0 + first.size.width * (1.0 - scale);
     CGFloat topGap = (margin + sc_statusBarHeight()) * 0.25;
     BOOL isRight = (CGRectGetMidX(first) > CGRectGetMidX(bounds));
@@ -378,8 +379,13 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
     } @catch (NSException *e) {
         SC_LOG(@"landscape dock tap session lookup threw %@", e.reason);
     }
+    if (!session && [delegate respondsToSelector:@selector(activeSession)]) {
+        @try { session = [(SCFloatingSceneManager *)delegate activeSession]; }
+        @catch (__unused NSException *e) {}
+        SC_LOG(@"landscape dock tap: container has no session, fall back to activeSession=%@", [session class]);
+    }
     if (!session) {
-        SC_LOG(@"landscape dock tap: no session for container");
+        SC_LOG(@"landscape dock tap: no session at all");
         return;
     }
     BOOL ok = NO;
@@ -388,7 +394,11 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
     } @catch (NSException *e) {
         SC_LOG(@"landscape dock tap dock threw %@", e.reason);
     }
-    SC_LOG(@"landscape dock tap direct dock corner=%ld ok=%d", (long)corner, ok);
+    if (!ok) {
+        SC_LOG(@"landscape dock tap direct dock corner=%ld ok=0 (session=%@)", (long)corner, [session class]);
+    } else {
+        SC_LOG(@"landscape dock tap direct dock corner=%ld ok=1", (long)corner);
+    }
 }
 
 #pragma mark - 入口
