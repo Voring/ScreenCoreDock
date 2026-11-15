@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.6
+//  ScreenCoreDock  v0.3.7
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
@@ -10,7 +10,7 @@
 //    3. 转进横屏不强制收回侧贴（v0.1.9）。
 //    4. 横屏卡片缩到 1/4 并重排（v0.2.x）：LandscapeDockScale 默认 0.5，左右间距对齐，顶部加一点点。
 //    5. 浮窗左侧手势区改为关闭浮窗（v0.3.1），顶部仍为全屏。
-//    6. 下拉通知中心不收回侧贴（v0.3.5）：按窗口类名判断 CoverSheet 在场。
+//    6. 下拉通知中心不收回侧贴（v0.3.5）：按可见窗口类名判断 CoverSheet 在场。
 //
 
 #import <Foundation/Foundation.h>
@@ -186,10 +186,28 @@ static BOOL sc_windowClassNameContains(const char *needle) {
         windows = [UIApplication sharedApplication].windows;
     } @catch (__unused NSException *e) {}
     for (UIWindow *w in windows) {
+        // 隐藏窗口（收起后的 CoverSheet 窗口仍留在 windows 数组里）不算在场
+        if (w.isHidden) continue;
         const char *n = object_getClassName(w);
         if (n && strstr(n, needle)) return YES;
     }
     return NO;
+}
+
+static void sc_dumpVisibleWindows(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSArray *windows = nil;
+        @try { windows = [UIApplication sharedApplication].windows; }
+        @catch (__unused NSException *e) {}
+        NSMutableString *names = [NSMutableString string];
+        for (UIWindow *w in windows) {
+            const char *n = object_getClassName(w);
+            [names appendFormat:@"%s(hidden=%d,level=%.0f) ", n ? n : "?",
+             (int)w.isHidden, w.windowLevel];
+        }
+        SC_LOG(@"visible windows: %@", names);
+    });
 }
 
 static BOOL sc_coverSheetPresented(void) {
@@ -244,7 +262,7 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
 
 static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
     if (sc_coverSheetPresented()) return;
-    
+
     if (sc_inOrientationChange) {
         NSInteger host = 0;
         @try {
@@ -453,12 +471,13 @@ static void installHook(int attempt) {
         }
     }
 
+    sc_dumpVisibleWindows();
     SC_LOG(@"hooked: open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.6 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.7 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
