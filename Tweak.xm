@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.1.9
+//  ScreenCoreDock  v0.2.0
 //
 //  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
 //  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
@@ -19,19 +19,21 @@
 //
 //  v0.1.8：横屏修复（放开 sc_dockSession:fromCorner: 的方向守卫）
 //  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
+//  v0.2.0：横屏卡片过大，按比例缩到 1/4 面积并重新紧凑堆叠
 //
-//    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
+//    v0.1.9 限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
 //
 //        0x42ec0  cmp   x26, #1          ; x26 = 新方向 - 3
 //        0x42ec4  b.hi  0x42eec          ; 非横屏跳过
 //        0x42ee0  bl    sc_restoreAllDockedSessionsAnimated:   ; 横屏 -> 全部收回
 //
-//    也就是只要方向变成横屏(3/4)，dockManager 会把所有已侧贴的 session 全部
-//    restore 回普通浮窗，结果就是「横屏不允许悬挂侧贴」。
-//    v0.1.9 的修法：hook SCFloatingSceneManager -sc_activeHostOrientationDidChange:duration:
-//    打一个「方向切换进行中」标记，再 hook SCFloatingDockManager
-//    -sc_restoreAllDockedSessionsAnimated:，当标记为真且 hostOrientation >= 3 时放行保留。
-//    手动「全部收回」等其它调用不在此期间，照常执行。
+//    修法：方向切换期间打标记，hook SCFloatingDockManager
+//    -sc_restoreAllDockedSessionsAnimated:，标记为真且 hostOrientation >= 3 时放行保留。
+//
+//    v0.2.0 尺寸根因：-sc_targetFramesForSide:（0x3a384）宽度 = hostWidth * 0.23
+//    （夹在 [88,170]），高度 = 宽度 * record.normalFrame 的高/宽比（0x3a650~0x3a668）。
+//    横屏下 normalFrame 仍是竖屏比例，高度就被推成接近整屏高。
+//    修法：横屏时按 scale 缩小宽高并重新自上而下紧凑堆叠（x 沿用插件贴边位置）。
 //
 //  v0.1.8 细节：
 //
@@ -48,14 +50,13 @@
 //    normalFrame 是否合法（0x3b0a0：非 null、非空、宽高 > 1），通过就把
 //    record 建出来、setFrame、addSubview、setDisplayState、setDocked。
 //
-//    所以横屏侧贴不了，卡点只在 manager 这一层的方向守卫。
 //    修法：hook -sc_dockSession:fromCorner:，原方法返回 NO 且当前是横屏时，
-//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法，让插件自己
-//    走完整的侧贴流程；仍失败则直接走 DockManager 层的同名方法兜底。
+//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法；仍失败则直接
+//    走 DockManager 层的同名方法兜底。
 //
-//    副作用说明：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
-//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位。
-//    这只影响下次旋转回来时的还原位置，不影响当次侧贴。
+//    副作用：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
+//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位，
+//    仅影响下次旋转回来时的还原位置。
 //
 
 #import <Foundation/Foundation.h>
@@ -82,8 +83,11 @@
 @end
 
 @interface SCFloatingDockManager : NSObject
-- (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (NSInteger)hostOrientation;
+- (UIView *)hostRootView;
+- (NSDictionary *)sc_targetFramesForSide:(NSInteger)side;
+- (void)sc_layoutSide:(NSInteger)side animated:(BOOL)animated completion:(void (^)(void))completion;
+- (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (void)sc_restoreAllDockedSessionsAnimated:(BOOL)animated;
 @end
 
@@ -92,6 +96,7 @@ static BOOL (*orig_dockSession)(id, SEL, id, NSInteger);
 static NSInteger (*orig_activeHostOrientation)(id, SEL);
 static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
 static void (*orig_restoreAllDocked)(id, SEL, BOOL);
+static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
@@ -165,6 +170,28 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
         sc_inOrientationChange = NO;
     }
     SC_LOG(@"orientation change -> %ld done", (long)orientation);
+
+    // 转进横屏后补一次侧边布局，让 hook_targetFramesForSide 的缩放帧真正落地
+    if (orientation >= 3) {
+        id dock = nil;
+        @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
+        @catch (__unused NSException *e) {}
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                for (NSInteger side = 1; side <= 2; side++) {
+                    @try {
+                        if ([dock respondsToSelector:@selector(sc_layoutSide:animated:completion:)]) {
+                            [(SCFloatingDockManager *)dock sc_layoutSide:side animated:NO completion:nil];
+                        }
+                    } @catch (NSException *e) {
+                        SC_LOG(@"landscape relayout side=%ld threw %@", (long)side, e.reason);
+                    }
+                }
+                SC_LOG(@"landscape relayout done");
+            }
+        });
+    }
 }
 
 // 插件在转入横屏时会调它把全部侧贴收回（0x42ec0/0x42ee0），这里放行保留
@@ -183,6 +210,73 @@ static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
         }
     }
     orig_restoreAllDocked(self, _cmd, animated);
+}
+
+#pragma mark - 横屏缩小卡片
+
+// 横屏下卡片尺寸：默认各边各缩一半（面积 1/4），可用偏好 LandscapeDockScale 调
+static CGFloat sc_landscapeScale(void) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("LandscapeDockScale"),
+                                                    CFSTR("com.voring.screencoredock"));
+    CGFloat s = 0.5;
+    if (v) {
+        if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+            s = [(__bridge NSNumber *)v doubleValue];
+        }
+        CFRelease(v);
+    }
+    if (s < 0.2) s = 0.2;
+    if (s > 1.0) s = 1.0;
+    return s;
+}
+
+// 横屏卡片变巨大的根因：targetFramesForSide 用 record 的 normalFrame 高/宽比推高度
+// (0x3a650~0x3a668)，而横屏下这个比例仍是竖屏的，算出来接近整屏高。
+// 这里在横屏时按比例重算尺寸并自上而下重新紧凑堆叠，x 沿用插件算好的贴边位置。
+static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
+    NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
+    if (frames.count == 0 || sc_forcePortrait) return frames;
+
+    NSInteger host = 0;
+    @try { host = [(SCFloatingDockManager *)self hostOrientation]; }
+    @catch (__unused NSException *e) {}
+    if (host < 3) return frames;   // 竖屏完全走原逻辑
+
+    CGRect bounds = CGRectZero;
+    @try {
+        UIView *root = [(SCFloatingDockManager *)self hostRootView];
+        if (root) bounds = root.bounds;
+    } @catch (__unused NSException *e) {}
+    if (CGRectIsEmpty(bounds)) return frames;
+
+    CGFloat scale = sc_landscapeScale();
+    NSArray *keys = [[frames allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+        CGRect fa = [(NSValue *)frames[a] CGRectValue];
+        CGRect fb = [(NSValue *)frames[b] CGRectValue];
+        if (fa.origin.y < fb.origin.y) return NSOrderedAscending;
+        if (fa.origin.y > fb.origin.y) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    if (keys.count == 0) return frames;
+    CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
+    CGFloat y = CGRectGetMinY(first);
+    CGFloat gap = 18.0 * scale;
+
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:keys.count];
+    for (id key in keys) {
+        CGRect old = [(NSValue *)frames[key] CGRectValue];
+        CGSize size = CGSizeMake(old.size.width * scale, old.size.height * scale);
+        if (CGRectGetMaxY(bounds) - y < size.height) {
+            y = MAX(CGRectGetMinY(bounds), CGRectGetMaxY(bounds) - size.height);
+        }
+        CGRect nr = CGRectMake(old.origin.x, y, size.width, size.height);
+        out[key] = [NSValue valueWithCGRect:nr];
+        y = CGRectGetMaxY(nr) + gap;
+        SC_LOG(@"landscape frames side=%ld scale=%.2f %@ -> %@", (long)side, scale,
+               NSStringFromCGRect(old), NSStringFromCGRect(nr));
+    }
+    return out;
 }
 
 #pragma mark - 入口
@@ -267,6 +361,12 @@ static void installHook(int attempt) {
     }
 
     Class dockCls = objc_getClass("SCFloatingDockManager");
+    if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_targetFramesForSide:)]) {
+        MSHookMessageEx(dockCls,
+                        @selector(sc_targetFramesForSide:),
+                        (IMP)hook_targetFramesForSide,
+                        (IMP *)&orig_targetFramesForSide);
+    }
     if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_restoreAllDockedSessionsAnimated:)]) {
         MSHookMessageEx(dockCls,
                         @selector(sc_restoreAllDockedSessionsAnimated:),
@@ -274,7 +374,7 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    SC_LOG(@"hooked (open + dockSession + activeHostOrientation + orientationChange + restoreAllDocked)");
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames)");
 }
 
 %ctor {
