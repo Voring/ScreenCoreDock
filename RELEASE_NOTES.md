@@ -53,16 +53,16 @@
 - 宽度 = `hostWidth * 0.23`，夹在 `[88, 170]`（常量 0x8c0c0=0.23、0x8c0c8=170.0）；
 - 高度 = 宽度 × **record.normalFrame 的高/宽比**（0x3a650~0x3a668 取 `CGRectGetHeight/CGRectGetWidth`）。
 
-横屏下 `normalFrame` 仍是竖屏比例（高/宽 > 1），高度被推成接近整屏高，卡片变成一大块。
+横屏下 `normalFrame` 仍是竖屏比例（高/宽 > 1），高度被推成接近整屏高。
 
 **修法**：hook `SCFloatingDockManager -sc_targetFramesForSide:`，仅当 `hostOrientation >= 3` 时：
 
 1. 每张卡的宽、高各乘 `scale`（默认 0.5，即面积 1/4）；
 2. 用重算后的高度自上而下重新紧凑堆叠（gap = 18 × scale）；
 3. 超出屏幕高度时向上夹紧；
-4. 竖屏完全走原逻辑，不干预。
+4. 竖屏完全走原逻辑。
 
-缩放系数可用偏好调整（不写则用 0.5）：
+缩放系数可用偏好调整：
 
 ```sh
 defaults write com.voring.screencoredock LandscapeDockScale -float 0.5
@@ -70,19 +70,21 @@ defaults write com.voring.screencoredock LandscapeDockScale -float 0.5
 
 另外，转进横屏后会延时 0.1s 对左右两侧各调一次 `-sc_layoutSide:animated:completion:`，确保缩放后的帧真正落地。
 
-### 横屏侧贴四向边距不一致（本版 v0.2.1 修）
+### 横屏左右/顶部边距（本版 v0.2.1 修）
 
-左右边距在插件里本来就是同一个常量 **8pt**（0x3aaec 的 `-8`、0x3aaf8 的 `+8`）；顶部用的是 `_SCFloatingPortraitTopInset`（0x33c98），而该函数在横屏（bounds 宽 > 高）时返回 **0**，所以顶部贴边。
+左右边距在插件里本来就是同一个常量 **8pt**（0x3aaec 的 `-8`、0x3aaf8 的 `+8`）；顶部用的是 `_SCFloatingPortraitTopInset`（0x33c98），而该函数在横屏（bounds 宽 > 高）时返回 **0**。
 
-右侧看着离得远，是 v0.2.0 的问题：缩尺寸时只重算了宽高、没重算右侧 x，右侧卡的 x 仍停在旧左边界，缩掉的一半宽度全变成右侧空隙（`8 + 0.5×旧宽 ≈ 90`，正好接近竖屏状态栏高度）。
+右侧看着离得远，是 v0.2.0 的问题：缩尺寸时只重算了宽高、没重算右侧 x，缩掉的一半宽度全变成右侧空隙（`8 + 0.5×旧宽 ≈ 93`）。
 
-**修法**：横屏重排时按插件原常量统一四向边距为 8pt：
+**修法**：横屏重排时统一左右间距，顶部再叠一个状态栏高度：
 
-- 左：`x = minX + 8`
-- 右：`x = maxX - 8 - 新宽`
-- 顶：`y = minY + 8`
+- 左右间距 `margin = 8 + 旧宽 × (1 - scale)`（即横屏右侧原本看到的那个间距）；
+- 左侧照拄同一值：`x = minX + margin`；右侧按新宽度重算：`x = maxX - margin - 新宽`；
+- 顶部 `topGap = margin + 状态栏高度`（优先读插件 `splitPortraitTopSpacing`，取不到用系统状态栏高度，再兜底 44）。
 
-不新增任何判定或参数。
+### 编译修复
+
+上一版对 `id` 直接发 `sc_floatingContainerView:didRequestDockFromCorner:` 报 `no known instance method`，本版补了 NSObject 分类声明，改用 `(NSObject *)delegate` 发送。
 
 ## 真机验证
 
