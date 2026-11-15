@@ -1,48 +1,60 @@
-# ScreenCoreDock v0.3.4
+# ScreenCoreDock v0.3.5
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.4`
+- 版本：`0.3.5`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## 崩溃原因
+## 上一个版为何又崩
 
-v0.3.3 装上后进安全模式，真机 ips（`SpringBoard-2026-11-15-191559.ips`）崩溃栈：
-
-```
-+[SBCoverSheetPresentationManager sharedInstance]
-  __49+[SBCoverSheetPresentationManager sharedInstance]_block_invoke
--[SBCoverSheetPresentationManager init]
--[SBCoverSheetPresentationManager _newRubberBandFeedbackGeneratorForSettings:]
-std::terminate() / abort()  SIGABRT
-```
-
-我们在启动 hook 阶段（`%ctor` 后立刻）就调了 `sharedInstance`。这个单例的 `init` 里要建震动反馈生成器，启动早期环境未就绪，直接 `abort()`；`@try/@catch` 拦不住 SIGABRT。
-
-## 本版修复
-
-- 启动时只 `objc_getClass` 看类是否存在，**不碰 `sharedInstance`**；
-- `sharedInstance` 延迟 5 秒后才在主队列懒加载，之后 hook 触发时才查询 CoverSheet 状态；
-- 其它回收拦截点（undock / restoreAll / closeSession / closeAll / restoreRecord 日志）保留。
-
-## 启动后日志预期
+v0.3.4 的 ips（`SpringBoard-2026-11-15-192652.ips`）崩溃帧：
 
 ```
-v0.3.4 loaded in SpringBoard
-hooked sc_undockSession:animated: ...
-coverSheet class=SBCoverSheetPresentationManager
-...（5 秒后）
-coverSheet manager=...
-coverSheet getter isCoverSheetPresented responds=...
-coverSheet getter coverSheetPresented responds=...
-coverSheet getter isPresented responds=...
-coverSheet getter presented responds=...
+NSStringFromClass
+objc_class::demangledName(bool)      <- 拷到一个非法类对象就炸
+_dispatch_continuation_pop          <- 我们 5 秒后的 dispatch_after 块
+ScreenCoreDock.dylib + 0x6978
 ```
 
-若 `coverSheet manager=nil` 或四个 getter 全 `responds=0`，把这段日志回传，再换状态来源。
+即：即使拖到 5 秒后再碰 `SBCoverSheetPresentationManager`，拿回来的东西不是合法对象，`NSStringFromClass` 一调用就崩。这个类在 SpringBoard 里不可随便探。
+
+## 本版改法
+
+彻底不碰 `SBCoverSheetPresentationManager`，改用窗口层判断：
+
+```objc
+static BOOL sc_windowClassNameContains(const char *needle) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        const char *n = object_getClassName(w);
+        if (n && strstr(n, needle)) return YES;
+    }
+    return NO;
+}
+
+static BOOL sc_coverSheetPresented(void) {
+    return sc_windowClassNameContains("CoverSheet")
+        || sc_windowClassNameContains("NotificationCenter");
+}
+```
+
+只用 `object_getClassName`：不构造 NSString、不查类、不碰单例，安全。
+
+回收拦截点保持：undock / restoreAll / closeSession / closeAll 均在该状态下跳过，restoreRecord 只记日志。
+
+## 启动 5 秒后的日志
+
+```
+windows at 5s: <SBWindow> <SBCoverSheetWindow> ...
+coverSheet by window name = 0
+```
+
+这两行是本版的关键诊断：
+
+- 若上面能看到类似 `SBCoverSheetWindow` / `SBNotificationCenterWindow` 的类名，说明判断依据可用；下拉通知中心后同样的判定就能命中；
+- 若窗口列表里完全看不到相关类名，把这一行回传，我改为按窗口层级或视图类名匹配。
 
 ## 保留的既有改动
 
