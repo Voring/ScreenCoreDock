@@ -1,67 +1,45 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.1.7
+//  ScreenCoreDock  v0.1.8
 //
-//  三种模式，靠偏好开关切换：
+//  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
+//  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
 //
-//    FreeFloatMode = 0（默认）  侧贴浮窗（v0.1.0 行为）：打开后 dock 到侧边，
-//                              卡片沿侧边自上而下堆叠，位置由插件布局决定。
+//  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
+//  (system-tool:fullscreen-to-screencore-split)
+//  由「前台应用 -> 分屏浮窗（居中大窗口）」改为「前台应用 -> 侧贴浮窗（贴屏幕两侧的小卡片）」。
 //
-//    FreeFloatMode = 1          取消停靠 -> 普通浮窗（displayState 3）：
-//                              走插件自己的 -sc_restoreRecordToNormalFrame:animated:completion:。
+//  逆向依据（ScreenCore.dylib 2.0.5 arm64 切片，未滑动虚拟地址，详见 README.md）：
+//    _SCFullscreenToSplitToolPerform            0x113a4
+//      -> -[SCFloatingSceneManager sc_openFrontmostApplicationAsSplitFromSourceRect:]  0x48eb8
+//         -> -[SCFloatingSceneManager sc_openSplitForBundleIdentifier:presentationSourceRect:]  0x46cf4
+//            -> ... 0x47f60 （创建 SCFloatingSceneSession，按 normalFrame 呈现）
+//  这条链路里没有任何 dock 调用，所以窗口必定是「分屏浮窗」。
+//  本 tweak 在原方法返回后取 activeSession 补一次 dock，使其落成「侧贴浮窗」。
 //
-//    FreeFloatMode = 2          dock 内任意位置：
-//                              仍是侧贴状态（displayState 1），但每张卡片可以停在
-//                              拖拽落点，不再被"自上而下堆叠"的布局拉回去。
+//  v0.1.8 唯一新增：横屏修复
 //
-//  —— 为什么模式 2 要动三处 ——
+//    -[SCFloatingSceneManager sc_dockSession:fromCorner:]（0x463ac）进函数后立刻
+//    校验 host 方向：
 //
-//  反汇编结论（arm64 切片，未滑动地址）：
+//        0x463e0  bl    activeHostOrientation
+//        0x463e4  sub   x8, x0, #1
+//        0x463e8  cmp   x8, #1
+//        0x463ec  b.hi  -> 0x46518      ; 直接 return NO
 //
-//  1) -sc_updateNormalizedYForOrder:（0x3e52c）
-//       遍历数组，对每条 record 调 setNormalizedY:(i+1)/(count+1)。
-//       它完全忽略落点 Y，normalizedY 只是序号百分比。
-//       normalizedY 的用途只有排序（-sc_sortedRecordsForSide:）。
+//    也就是只接受 1(竖屏) / 2(倒竖屏)，横屏(3/4)直接返回 NO，什么都不做。
+//    而它下层的 DockManager 同名方法（0x3bde4）没有方向判断，只校验
+//    normalFrame 是否合法（0x3b0a0：非 null、非空、宽高 > 1），通过就把
+//    record 建出来、setFrame、addSubview、setDisplayState、setDocked。
 //
-//  2) -sc_targetFramesForSide:���0x3a384）
-//       取 sortedRecordsForSide，逐条算尺寸后累加 Y：
-//         0x3aa84  y = y + (gap + height)        // gap = count>1 ? 18 : 0
-//       纵向没有任何"槽位"参数可调，就是自上而下堆叠。
-//       所以想任意放置，只能覆盖它返回的帧表。
+//    所以横屏侧贴不了，卡点只在 manager 这一层的方向守卫。
+//    修法：hook -sc_dockSession:fromCorner:，原方法返回 NO 且当前是横屏时，
+//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法，让插件自己
+//    走完整的侧贴流程；仍失败则直接走 DockManager 层的同名方法兜底。
 //
-//  3) -sc_dockedFloatingItemView:didMoveToCenter:state:velocity:（0x3f200）
-//       拖拽收尾层。内部 0x3f664 又调 -sc_moveDraggingRecord:toSide:center:，
-//       随后用 hostRootView bounds 内联算槽位 x、对 y 夹紧，直接
-//       setCenter: 到 itemView(0x3f74c) 和 containerView(0x3f77c)，绕过 applyFrame。
-//       这一层不摁住，就会出现：只能沿中轴线移动 / 左右闪烁 / 回不到两侧。
-//
-//  模式 2 的实现：
-//    A. hook  -sc_moveDraggingRecord:toSide:center:
-//         记下落点中心（hostRootView 坐标系）+ 钉住 side，
-//         避免 0x3e790 用 center.x 与帧 x 比较导致 side 反复翻转（闪烁来源）。
-//    B. hook  -sc_targetFramesForSide:
-//         对"有自由中心"的 record，把槽位平移（尺寸沿用槽位尺寸）到该中心。
-//         尺寸必须沿用：-sc_applyFrame:toRecord: 内部按 目标帧尺寸/normalFrame 尺寸
-//         算缩放，尺寸被改大就会把卡片放大数倍。
-//    C. hook  -sc_dockedFloatingItemView:didMoveToCenter:state:velocity:
-//         命中自由记录时直接返回，不调 orig。
-//
-//  已验证选择器（ScreenCore 2.0.5 arm64）：
-//    -sc_openFrontmostApplicationAsSplitFromSourceRect:        0x48eb8
-//    -activeSession          0x65260(stub)   -dockManager      0x66880
-//    -records                0x69120          -itemView         0x39e80
-//    -session                0x6c920(stub)    -side             0x70320
-//    -sc_recordsForSide:      0x3a170
-//    -sc_targetFramesForSide: 0x3a384
-//    -sc_moveDraggingRecord:toSide:center: 0x3e5e4 (stub 0x6af20)
-//    -sc_dockedFloatingItemView:didMoveToCenter:state:velocity: 0x3f200
-//    -sc_restoreRecordToNormalFrame:animated:completion: 0x3c7e0
-//    -displayState / -setDisplayState: 0x66820 / 0x6d7a0(stub)
-//
-//  v0.1.7 修编译错误（上一版 CI 失败）：
-//    - 关联键改用 &static char，不能用 @"..."（ObjC++ 不隐式转 const void*）
-//    - NSNumber 才有 integerValue，NSValue 没有
-//    - switch/case 不能跨过强捕获 block 的生命周期，改用独立函数 + if/else
+//    副作用说明：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
+//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位。
+//    这只影响下次旋转回来时的还原位置，不影响当次侧贴。
 //
 
 #import <Foundation/Foundation.h>
@@ -69,78 +47,30 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 
-#define SC_DOMAIN        CFSTR("com.susudear.screencore")
-#define SC_TWEAK_DOMAIN  CFSTR("com.voring.screencoredock")
-#define SC_PREF_KEY      CFSTR("FreeFloatMode")
+#define SC_DOMAIN CFSTR("com.susudear.screencore")
 #define SC_LOG(fmt, ...) NSLog(@"[ScreenCoreDock] " fmt, ##__VA_ARGS__)
 
+// 只做声明，不提供实现；运行时类由 ScreenCore.dylib 提供。
+// corner：1 = 一侧，2 = 另一侧（插件内部 sc_dockSessionForSingleActiveWindow: 就是这么映射的）
 @interface SCFloatingSceneManager : NSObject
 - (BOOL)sc_openFrontmostApplicationAsSplitFromSourceRect:(CGRect)rect;
 - (id)activeSession;
 - (id)dockManager;
+- (NSInteger)activeHostOrientation;   // 1 竖屏 / 2 倒竖屏 / 3、4 横屏
 - (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
 @end
 
-@interface SCFloatingSceneSession : NSObject
-- (id)containerView;
-@end
-
 @interface SCFloatingDockManager : NSObject
-- (UIView *)hostRootView;
-- (NSArray *)records;
-- (NSArray *)sc_recordsForSide:(NSInteger)side;
-- (NSDictionary *)sc_targetFramesForSide:(NSInteger)side;
-- (void)sc_moveDraggingRecord:(id)record toSide:(NSInteger)side center:(CGPoint)center;
-- (void)sc_dockedFloatingItemView:(UIView *)itemView
-                   didMoveToCenter:(CGPoint)center
-                            state:(NSInteger)state
-                         velocity:(CGPoint)velocity;
-- (void)sc_restoreRecordToNormalFrame:(id)record
-                            animated:(BOOL)animated
-                          completion:(void (^)(void))completion;
-@end
-
-@interface SCFloatingDockRecord : NSObject
-- (UIView *)itemView;
-- (id)session;
-- (NSInteger)side;
-@end
-
-@interface SCFloatingContainer : NSObject
-- (NSInteger)displayState;
-- (void)setDisplayState:(NSInteger)state;
+- (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 @end
 
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
+static BOOL (*orig_dockSession)(id, SEL, id, NSInteger);
+static NSInteger (*orig_activeHostOrientation)(id, SEL);
 
-static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
-static void (*orig_moveDraggingRecord)(id, SEL, id, NSInteger, CGPoint);
-static void (*orig_didMoveToCenter)(id, SEL, UIView *, CGPoint, NSInteger, CGPoint);
-
-// record -> NSValue(CGPoint)：用户希望的卡片中心（hostRootView 坐标系）
-static char kFreeCenterKey;
-// record -> NSNumber(NSInteger)：钉住的 side
-static char kPinnedSideKey;
-
-#pragma mark - 偏好
-
-static NSInteger sc_mode(void) {
-    CFPropertyListRef v = CFPreferencesCopyAppValue(SC_PREF_KEY, SC_TWEAK_DOMAIN);
-    NSInteger mode = 0;
-    if (v) {
-        if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
-            mode = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
-        } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
-            mode = [(__bridge NSNumber *)v integerValue];
-        } else if (CFGetTypeID(v) == CFStringGetTypeID()) {
-            mode = [(__bridge NSString *)v integerValue];
-        }
-        CFRelease(v);
-    }
-    if (mode < 0 || mode > 2) mode = 0;
-    return mode;
-}
+// 只在横屏重入 dock 期间为 YES
+static BOOL sc_forcePortrait = NO;
 
 static NSInteger sc_defaultDockCorner(void) {
     NSNumber *side = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
@@ -149,236 +79,91 @@ static NSInteger sc_defaultDockCorner(void) {
     return ([side integerValue] == 1) ? 2 : 1;
 }
 
-#pragma mark - 工具
+#pragma mark - 横屏修复
 
-static CGRect sc_hostBounds(id dock) {
-    CGRect host = CGRectNull;
+static NSInteger hook_activeHostOrientation(id self, SEL _cmd) {
+    if (sc_forcePortrait) return 1;
+    return orig_activeHostOrientation(self, _cmd);
+}
+
+static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
+    BOOL ok = orig_dockSession(self, _cmd, session, corner);
+    if (ok) return YES;
+
+    NSInteger orientation = 1;
     @try {
-        UIView *root = [(SCFloatingDockManager *)dock hostRootView];
-        if (root) host = root.bounds;
+        orientation = [(SCFloatingSceneManager *)self activeHostOrientation];
     } @catch (__unused NSException *e) {}
-    if (CGRectIsEmpty(host) || host.size.width < 1) host = [UIScreen mainScreen].bounds;
-    return host;
-}
 
-static CGPoint sc_clampCenter(CGPoint c, CGSize size, CGRect host) {
-    CGFloat hw = size.width / 2.0, hh = size.height / 2.0;
-    CGFloat minX = CGRectGetMinX(host) + hw, maxX = CGRectGetMaxX(host) - hw;
-    CGFloat minY = CGRectGetMinY(host) + hh, maxY = CGRectGetMaxY(host) - hh;
-    if (maxX < minX) maxX = minX;
-    if (maxY < minY) maxY = minY;
-    c.x = MAX(minX, MIN(maxX, c.x));
-    c.y = MAX(minY, MIN(maxY, c.y));
-    return c;
-}
-
-static CGRect sc_rectCenteredAt(CGPoint c, CGSize size) {
-    return CGRectMake(c.x - size.width / 2.0, c.y - size.height / 2.0, size.width, size.height);
-}
-
-/// 从 itemView 反查 record
-static id sc_recordForItemView(id dock, UIView *itemView) {
-    if (!dock || !itemView) return nil;
-    NSArray *all = nil;
-    @try { all = [(SCFloatingDockManager *)dock records]; } @catch (__unused NSException *e) {}
-    for (id record in all) {
-        UIView *view = nil;
-        @try { view = [(SCFloatingDockRecord *)record itemView]; } @catch (__unused NSException *e) {}
-        if (view == itemView) return record;
+    // 竖屏被拒说明是别的原因（session 不 live / 已 dock / 槽位满），不插手
+    if (orientation < 3) {
+        SC_LOG(@"dock rejected in portrait-%ld, leave as is", (long)orientation);
+        return NO;
     }
-    return nil;
-}
 
-#pragma mark - 模式 0：dock 到侧边（v0.1.0 行为）
-
-static void sc_dockSession(SCFloatingSceneManager *manager) {
-    id session = [manager activeSession];
-    if (!session) {
-        SC_LOG(@"dock path: activeSession == nil, skip");
-        return;
-    }
-    NSInteger corner = sc_defaultDockCorner();
-    BOOL ok = NO;
+    SC_LOG(@"dock rejected in landscape(%ld), retry with forced portrait", (long)orientation);
+    sc_forcePortrait = YES;
     @try {
-        if ([manager respondsToSelector:@selector(sc_dockSession:fromCorner:)]) {
-            ok = [manager sc_dockSession:session fromCorner:corner];
-        }
-    } @catch (NSException *e) {
-        SC_LOG(@"dock path: sc_dockSession threw %@", e.reason);
+        ok = orig_dockSession(self, _cmd, session, corner);
+    } @finally {
+        sc_forcePortrait = NO;
     }
-    if (!ok) {
-        @try {
-            if ([manager respondsToSelector:@selector(sc_dockSessionForSingleActiveWindow:)]) {
-                ok = [manager sc_dockSessionForSingleActiveWindow:session];
-            }
-        } @catch (NSException *e) {
-            SC_LOG(@"dock path: singleActiveWindow threw %@", e.reason);
-        }
+    if (ok) {
+        SC_LOG(@"landscape dock ok via forced-orientation retry");
+        return YES;
     }
-    SC_LOG(@"dock path: corner=%ld ok=%d session=%p", (long)corner, ok, session);
-}
 
-#pragma mark - 模式 1：取消停靠 -> 普通浮窗
-
-static void sc_tryRestoreToNormalFloating(SCFloatingSceneManager *manager, id session) {
+    // 兜底：manager 层还有别的拦截时，直接走 DockManager 层（该层无方向守卫）
     id dock = nil;
-    @try {
-        if ([manager respondsToSelector:@selector(dockManager)]) dock = [manager dockManager];
-    } @catch (NSException *e) {
-        SC_LOG(@"free path: dockManager threw %@", e.reason);
-    }
-
-    NSInteger restored = 0;
-    if ([dock respondsToSelector:@selector(sc_recordsForSide:)] &&
-        [dock respondsToSelector:@selector(sc_restoreRecordToNormalFrame:animated:completion:)]) {
-        for (NSInteger side = 1; side <= 2; side++) {
-            NSArray *recs = nil;
-            @try { recs = [(SCFloatingDockManager *)dock sc_recordsForSide:side]; }
-            @catch (NSException *e) { SC_LOG(@"free path: recordsForSide:%ld threw %@", (long)side, e.reason); }
-
-            for (id record in recs) {
-                id owner = nil;
-                @try { owner = [(SCFloatingDockRecord *)record session]; }
-                @catch (__unused NSException *e) {}
-                if (owner != session) continue;
-
-                @try {
-                    [(SCFloatingDockManager *)dock sc_restoreRecordToNormalFrame:record
-                                                                        animated:NO
-                                                                      completion:nil];
-                    restored++;
-                    SC_LOG(@"free path: restored record %p (side=%ld)", record, (long)side);
-                } @catch (NSException *e) {
-                    SC_LOG(@"free path: restore threw %@", e.reason);
-                }
-            }
-        }
-    }
-
-    SCFloatingContainer *container = nil;
-    @try { container = [session containerView]; } @catch (__unused NSException *e) {}
-    if (container && [container respondsToSelector:@selector(setDisplayState:)]) {
-        NSInteger before = 0;
-        @try { before = [container displayState]; } @catch (__unused NSException *e) {}
+    @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
+    @catch (__unused NSException *e) {}
+    if ([dock respondsToSelector:@selector(sc_dockSession:fromCorner:)]) {
         @try {
-            [container setDisplayState:3];
-            SC_LOG(@"free path: displayState %ld -> 3 (restored=%ld)", (long)before, (long)restored);
+            ok = [(SCFloatingDockManager *)dock sc_dockSession:session fromCorner:corner];
         } @catch (NSException *e) {
-            SC_LOG(@"free path: setDisplayState:3 threw %@", e.reason);
+            SC_LOG(@"dockManager fallback threw %@", e.reason);
         }
-    } else {
-        SC_LOG(@"free path: no containerView (restored=%ld)", (long)restored);
+        SC_LOG(@"landscape dock fallback via dockManager ok=%d", ok);
     }
-}
-
-#pragma mark - 模式 2：dock 内任意位置
-
-static void hook_moveDraggingRecord(id self, SEL _cmd, id record, NSInteger side, CGPoint center) {
-    CGRect host = sc_hostBounds(self);
-
-    // 记录落点；同时把 side 钉住，避免 0x3e790 按 center.x 反复翻转 side（闪烁源）
-    NSInteger pinned = side;
-    NSNumber *oldSide = objc_getAssociatedObject(record, &kPinnedSideKey);
-    if ([oldSide isKindOfClass:[NSNumber class]]) pinned = [oldSide integerValue];
-
-    objc_setAssociatedObject(record, &kFreeCenterKey,
-                             [NSValue valueWithCGPoint:center],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(record, &kPinnedSideKey,
-                             @(pinned),
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    SC_LOG(@"drag drop record=%p side=%ld pinned=%ld center=%@ host=%@",
-           record, (long)side, (long)pinned, NSStringFromCGPoint(center), NSStringFromCGRect(host));
-
-    orig_moveDraggingRecord(self, _cmd, record, pinned, center);
-}
-
-static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
-    NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
-    if (!frames.count) return frames;
-
-    CGRect host = sc_hostBounds(self);
-    NSMutableDictionary *patched = nil;
-
-    for (id key in [frames allKeys]) {
-        id record = nil;
-        if ([key isKindOfClass:[NSValue class]]) {
-            @try { record = [(NSValue *)key nonretainedObjectValue]; } @catch (__unused NSException *e) {}
-        }
-        if (!record) record = key;
-
-        NSValue *custom = objc_getAssociatedObject(record, &kFreeCenterKey);
-        if (![custom isKindOfClass:[NSValue class]]) continue;
-
-        NSNumber *pinnedSide = objc_getAssociatedObject(record, &kPinnedSideKey);
-        if ([pinnedSide isKindOfClass:[NSNumber class]] &&
-            [pinnedSide integerValue] != side) continue;  // 只改它自己那一侧
-
-        CGRect slot = [frames[key] CGRectValue];          // 尺寸沿用槽位尺寸
-        CGPoint c = sc_clampCenter([custom CGPointValue], slot.size, host);
-        CGRect moved = sc_rectCenteredAt(c, slot.size);
-
-        if (!patched) patched = [frames mutableCopy];
-        patched[key] = [NSValue valueWithCGRect:moved];
-        SC_LOG(@"frames side=%ld record=%p %@ -> %@", (long)side, record,
-               NSStringFromCGRect(slot), NSStringFromCGRect(moved));
-    }
-    return patched ?: frames;
-}
-
-/// 收尾层直接吞掉：它内部会再算槽位并对 itemView/containerView setCenter
-static void hook_didMoveToCenter(id self, SEL _cmd, UIView *itemView, CGPoint center,
-                                 NSInteger state, CGPoint velocity) {
-    id record = sc_recordForItemView(self, itemView);
-    NSValue *custom = record ? objc_getAssociatedObject(record, &kFreeCenterKey) : nil;
-    if (record && [custom isKindOfClass:[NSValue class]]) {
-        CGRect host = sc_hostBounds(self);
-        CGSize size = itemView ? itemView.bounds.size : CGSizeMake(0, 0);
-        CGPoint c = sc_clampCenter([custom CGPointValue], size, host);
-        if (itemView) itemView.center = c;
-        SC_LOG(@"didMove swallowed record=%p -> center=%@ (orig would use %@)",
-               record, NSStringFromCGPoint(c), NSStringFromCGPoint(center));
-        return;
-    }
-    orig_didMoveToCenter(self, _cmd, itemView, center, state, velocity);
+    return ok;
 }
 
 #pragma mark - 入口
 
-// 独立成函数，避免 switch/case 跨过 block 的强捕获生命周期（clang: cannot jump into block scope）
-static void sc_scheduleRestoreToFloating(SCFloatingSceneManager *manager) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            id session = [manager activeSession];
-            if (!session) {
-                SC_LOG(@"free path: activeSession == nil");
-                return;
-            }
-            sc_tryRestoreToNormalFloating(manager, session);
+static void sc_dockSessionIfPossible(SCFloatingSceneManager *manager) {
+    id session = [manager activeSession];
+    if (!session) {
+        SC_LOG(@"activeSession == nil, skip dock");
+        return;
+    }
+
+    NSInteger corner = sc_defaultDockCorner();
+    BOOL docked = NO;
+    @try {
+        docked = [manager sc_dockSession:session fromCorner:corner];
+    } @catch (NSException *e) {
+        SC_LOG(@"sc_dockSession:fromCorner: threw %@", e.reason);
+    }
+    if (!docked) {
+        // 兜底：走插件自己的「单窗口侧贴」封装（内部会再判 isLiveSession / isSessionDocked）
+        @try {
+            docked = [manager sc_dockSessionForSingleActiveWindow:session];
+        } @catch (NSException *e) {
+            SC_LOG(@"sc_dockSessionForSingleActiveWindow: threw %@", e.reason);
         }
-    });
+    }
+    SC_LOG(@"dock corner=%ld ok=%d", (long)corner, docked);
 }
 
 static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
     BOOL result = orig_openFrontmostAsSplit(self, _cmd, rect);
     if (!result) {
-        SC_LOG(@"open returned NO, nothing to do");
+        SC_LOG(@"open returned NO, skip dock");
         return result;
     }
 
-    SCFloatingSceneManager *manager = (SCFloatingSceneManager *)self;
-    NSInteger mode = sc_mode();
-    SC_LOG(@"open ok, mode=%ld", (long)mode);
-
-    if (mode == 1) {
-        sc_scheduleRestoreToFloating(manager);
-    } else {
-        // 模式 0 与模式 2 都先 dock 到侧边；模式 2 的后续位置由三枚 dock hook 接管
-        @autoreleasepool {
-            sc_dockSession(manager);
-        }
+    @autoreleasepool {
+        sc_dockSessionIfPossible((SCFloatingSceneManager *)self);
     }
     return result;
 }
@@ -386,6 +171,7 @@ static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
 static void installHook(int attempt) {
     Class cls = objc_getClass("SCFloatingSceneManager");
     if (!cls) {
+        // ScreenCore.dylib 可能比本 tweak 后加载，短暂重试
         if (attempt >= 50) {
             SC_LOG(@"SCFloatingSceneManager not found, hook aborted");
             return;
@@ -402,26 +188,20 @@ static void installHook(int attempt) {
                     (IMP)hook_openFrontmostAsSplit,
                     (IMP *)&orig_openFrontmostAsSplit);
 
-    // dock 侧三枚：始终安装，非模式 2 时靠 assoc 为空自动放行
-    Class dockCls = objc_getClass("SCFloatingDockManager");
-    if (!dockCls) {
-        SC_LOG(@"SCFloatingDockManager not found, dock hooks skipped");
-    } else {
-        MSHookMessageEx(dockCls,
-                        @selector(sc_targetFramesForSide:),
-                        (IMP)hook_targetFramesForSide,
-                        (IMP *)&orig_targetFramesForSide);
-        MSHookMessageEx(dockCls,
-                        @selector(sc_moveDraggingRecord:toSide:center:),
-                        (IMP)hook_moveDraggingRecord,
-                        (IMP *)&orig_moveDraggingRecord);
-        MSHookMessageEx(dockCls,
-                        @selector(sc_dockedFloatingItemView:didMoveToCenter:state:velocity:),
-                        (IMP)hook_didMoveToCenter,
-                        (IMP *)&orig_didMoveToCenter);
+    MSHookMessageEx(cls,
+                    @selector(sc_dockSession:fromCorner:),
+                    (IMP)hook_dockSession,
+                    (IMP *)&orig_dockSession);
+
+    // 只有 manager 这一层有方向守卫，改它的返回值即可
+    if ([cls instancesRespondToSelector:@selector(activeHostOrientation)]) {
+        MSHookMessageEx(cls,
+                        @selector(activeHostOrientation),
+                        (IMP)hook_activeHostOrientation,
+                        (IMP *)&orig_activeHostOrientation);
     }
 
-    SC_LOG(@"hooked (mode=%ld, dockClass=%s)", (long)sc_mode(), dockCls ? class_getName(dockCls) : "nil");
+    SC_LOG(@"hooked (open + dockSession + activeHostOrientation)");
 }
 
 %ctor {
