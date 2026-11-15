@@ -1,33 +1,31 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock
+//  ScreenCoreDock  v0.1.6
 //
-//  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
-//  (system-tool:fullscreen-to-screencore-split) 打开的窗口，保持在原生普通浮窗状态，
-//  不进入侧贴（dock）排列，从而沿用插件原生的自由拖动 / 缩放 / 记忆位置能力。
+//  两个互斥模式，靠偏好开关切换（不写死在代码里）：
 //
-//  背景（逆向结论）：
-//    - 侧贴 = containerView displayState 1；普通浮窗 = displayState 3。
-//    - 原插件链路：_SCFullscreenToSplitToolPerform
-//        -> -sc_openFrontmostApplicationAsSplitFromSourceRect: 0x48eb8
-//        -> -sc_openSplitForBundleIdentifier:presentationSourceRect: 0x46cf4
-//      我们之前在打开后额外调了 -sc_dockSession:fromCorner:，把会话切成 state 1 侧贴。
-//    - 侧贴布局模型：record 坐标 = f(side, order)，松手必回槽位；
-//      拖拽结束 -sc_moveDraggingRecord:toSide:center: 0x3e5e4
-//        -> -sc_updateNormalizedYForOrder: 0x3e52c
-//        -> -sc_layoutSide:animated:completion: 0x3b1fc
-//        -> -sc_targetFramesForSide: 0x3a384
-//        -> -sc_applyFrame:toRecord: 0x3ac70
-//      这套模型在拖拽收尾和重排两层都会把位置拉回边缘，硬改槽位无法稳定自由摆放，
-//      所以本版不再挂钩这套侧贴布局，只保证打开后是普通浮窗。
+//    FreeFloatMode = 0（默认）  还原 v0.1.0 的「全屏转侧贴浮窗」：
+//        打开后把会话停靠到侧边（displayState 1），也就是你原来 1.0 的效果。
+//        v0.1.5 删掉了 dock 调用，导致这个功能失效，本版恢复。
 //
-//  逆向依据（arm64 切片，未滑动虚拟地址）：
-//    0x113a4  _SCFullscreenToSplitToolPerform
-//    0x48eb8  -sc_openFrontmostApplicationAsSplitFromSourceRect:
-//    0x46cf4  -sc_openSplitForBundleIdentifier:presentationSourceRect:
-//    0x463ac  -sc_dockSession:fromCorner:        （内部 setDisplayState:1）
-//    0x3c8d0  还原普通帧时 setDisplayState:3
-//    0x38b3c  displayState / 0x38b4c setDisplayState:
+//    FreeFloatMode = 1          自由浮窗：
+//        打开后不留在 dock，改用插件自己的「还原普通帧」例程
+//        -sc_restoreRecordToNormalFrame:animated:completion:（0x3c7e0），
+//        它内部会 setDisplayState:3 并动画回 normalFrame，
+//        普通浮窗（displayState 3）不受侧边槽位模型约束。
+//        注意：这是「取消停靠」，不做贴边吸附，松手不会回侧边竖排。
+//
+//  已验证选择器（ScreenCore 2.0.5 arm64，未滑动地址）：
+//    -sc_openFrontmostApplicationAsSplitFromSourceRect:      0x48eb8
+//    -activeSession                                          0x65260(stub)
+//    -dockManager                                            0x66880
+//    -sc_dockSession:fromCorner:                             0x463ac
+//    -sc_dockSessionForSingleActiveWindow:                   0x462e4
+//    -sc_recordsForSide:                                     0x3a170
+//    -sc_restoreRecordToNormalFrame:animated:completion:     0x3c7e0
+//    -session（record 上）                                   0x6c920(stub)
+//    -containerView                                          0x661e0
+//    -displayState / -setDisplayState:                       0x66820 / 0x6d7a0(stub)
 //
 
 #import <Foundation/Foundation.h>
@@ -35,16 +33,32 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 
-#define SC_DOMAIN CFSTR("com.susudear.screencore")
+#define SC_DOMAIN        CFSTR("com.susudear.screencore")
+#define SC_TWEAK_DOMAIN  CFSTR("com.voring.screencoredock")
+#define SC_PREF_KEY      CFSTR("FreeFloatMode")
 #define SC_LOG(fmt, ...) NSLog(@"[ScreenCoreDock] " fmt, ##__VA_ARGS__)
 
 @interface SCFloatingSceneManager : NSObject
 - (BOOL)sc_openFrontmostApplicationAsSplitFromSourceRect:(CGRect)rect;
 - (id)activeSession;
+- (id)dockManager;
+- (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
+- (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
 @end
 
-@interface SCFloatingSession : NSObject
+@interface SCFloatingSceneSession : NSObject
 - (id)containerView;
+@end
+
+@interface SCFloatingDockManager : NSObject
+- (NSArray *)sc_recordsForSide:(NSInteger)side;
+- (void)sc_restoreRecordToNormalFrame:(id)record
+                            animated:(BOOL)animated
+                          completion:(void (^)(void))completion;
+@end
+
+@interface SCFloatingDockRecord : NSObject
+- (id)session;
 @end
 
 @interface SCFloatingContainer : NSObject
@@ -54,36 +68,149 @@
 
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
 
-static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
-    BOOL result = orig_openFrontmostAsSplit(self, _cmd, rect);
-    if (!result) return result;
+#pragma mark - 偏好
 
-    @autoreleasepool {
-        id session = [(SCFloatingSceneManager *)self activeSession];
-        if (!session) {
-            SC_LOG(@"activeSession == nil after open");
-            return result;
+static BOOL sc_freeFloatMode(void) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue(SC_PREF_KEY, SC_TWEAK_DOMAIN);
+    BOOL on = NO;
+    if (v) {
+        if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+            on = CFBooleanGetValue((CFBooleanRef)v);
+        } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+            on = [(__bridge NSNumber *)v boolValue];
+        } else if (CFGetTypeID(v) == CFStringGetTypeID()) {
+            on = [(__bridge NSString *)v boolValue];
         }
-        SCFloatingContainer *container = nil;
-        @try { container = [session containerView]; } @catch (__unused NSException *e) {}
+        CFRelease(v);
+    }
+    return on;
+}
 
-        NSInteger before = 0;
-        @try { before = [container displayState]; } @catch (__unused NSException *e) {}
+static NSInteger sc_defaultDockCorner(void) {
+    NSNumber *side = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
+        CFSTR("splitDefaultDockSide"), SC_DOMAIN);
+    if (![side isKindOfClass:[NSNumber class]]) return 1;
+    return ([side integerValue] == 1) ? 2 : 1;
+}
 
-        // 不做 dock：确保容器处于普通浮窗状态（state 3），不切到侧贴 state 1。
-        if (container && [container respondsToSelector:@selector(setDisplayState:)]) {
-            @try {
-                [container setDisplayState:3];
-                SC_LOG(@"session=%p container=%p displayState %ld -> 3 (normal floating)",
-                       session, container, (long)before);
-            } @catch (NSException *e) {
-                SC_LOG(@"setDisplayState:3 failed: %@", e.reason);
+#pragma mark - 模式 0：停靠到侧边（还原 v0.1.0）
+
+static void sc_dockSession(SCFloatingSceneManager *manager) {
+    id session = [manager activeSession];
+    if (!session) {
+        SC_LOG(@"dock path: activeSession == nil, skip");
+        return;
+    }
+    NSInteger corner = sc_defaultDockCorner();
+    BOOL ok = NO;
+    @try {
+        if ([manager respondsToSelector:@selector(sc_dockSession:fromCorner:)]) {
+            ok = [manager sc_dockSession:session fromCorner:corner];
+        }
+    } @catch (NSException *e) {
+        SC_LOG(@"dock path: sc_dockSession threw %@", e.reason);
+    }
+    if (!ok) {
+        @try {
+            if ([manager respondsToSelector:@selector(sc_dockSessionForSingleActiveWindow:)]) {
+                ok = [manager sc_dockSessionForSingleActiveWindow:session];
             }
-        } else {
-            SC_LOG(@"session=%p no containerView/setDisplayState, state=%ld",
-                   session, (long)before);
+        } @catch (NSException *e) {
+            SC_LOG(@"dock path: singleActiveWindow threw %@", e.reason);
         }
     }
+    SC_LOG(@"dock path: corner=%ld ok=%d session=%p", (long)corner, ok, session);
+}
+
+#pragma mark - 模式 1：取消停靠 -> 普通浮窗
+
+static void sc_tryRestoreToNormalFloating(SCFloatingSceneManager *manager, id session) {
+    id dock = nil;
+    @try {
+        if ([manager respondsToSelector:@selector(dockManager)]) dock = [manager dockManager];
+    } @catch (NSException *e) {
+        SC_LOG(@"free path: dockManager threw %@", e.reason);
+    }
+    if (!dock) {
+        SC_LOG(@"free path: dockManager == nil");
+    }
+
+    NSInteger restored = 0;
+    if ([dock respondsToSelector:@selector(sc_recordsForSide:)] &&
+        [dock respondsToSelector:@selector(sc_restoreRecordToNormalFrame:animated:completion:)]) {
+        for (NSInteger side = 1; side <= 2; side++) {
+            NSArray *records = nil;
+            @try { records = [(SCFloatingDockManager *)dock sc_recordsForSide:side]; }
+            @catch (NSException *e) { SC_LOG(@"free path: recordsForSide:%ld threw %@", (long)side, e.reason); }
+
+            for (id record in records) {
+                id owner = nil;
+                @try { owner = [(SCFloatingDockRecord *)record session]; }
+                @catch (__unused NSException *e) {}
+                if (owner != session) continue;
+
+                @try {
+                    [(SCFloatingDockManager *)dock sc_restoreRecordToNormalFrame:record
+                                                                        animated:NO
+                                                                      completion:nil];
+                    restored++;
+                    SC_LOG(@"free path: restored record %p (side=%ld)", record, (long)side);
+                } @catch (NSException *e) {
+                    SC_LOG(@"free path: restore threw %@", e.reason);
+                }
+            }
+        }
+    }
+
+    // 兜底：直接把容器拉回普通浮窗状态
+    SCFloatingContainer *container = nil;
+    @try { container = [session containerView]; } @catch (__unused NSException *e) {}
+    if (container && [container respondsToSelector:@selector(setDisplayState:)]) {
+        NSInteger before = 0;
+        @try { before = [container displayState]; } @catch (__unused NSException *e) {}
+        @try {
+            [container setDisplayState:3];
+            SC_LOG(@"free path: displayState %ld -> 3 (restored=%ld)", (long)before, (long)restored);
+        } @catch (NSException *e) {
+            SC_LOG(@"free path: setDisplayState:3 threw %@", e.reason);
+        }
+    } else {
+        SC_LOG(@"free path: no containerView (restored=%ld)", (long)restored);
+    }
+}
+
+#pragma mark - 入口
+
+static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
+    BOOL result = orig_openFrontmostAsSplit(self, _cmd, rect);
+    if (!result) {
+        SC_LOG(@"open returned NO, nothing to do");
+        return result;
+    }
+
+    SCFloatingSceneManager *manager = (SCFloatingSceneManager *)self;
+    BOOL freeMode = sc_freeFloatMode();
+    SC_LOG(@"open ok, mode=%s", freeMode ? "free-float(1)" : "dock(0)");
+
+    if (!freeMode) {
+        @autoreleasepool {
+            sc_dockSession(manager);
+        }
+        return result;
+    }
+
+    // 停靠时才有的 record 列表，等一拍让 dock 状态落地再撤
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            id session = [manager activeSession];
+            if (!session) {
+                SC_LOG(@"free path: activeSession == nil");
+                return;
+            }
+            sc_tryRestoreToNormalFloating(manager, session);
+        }
+    });
     return result;
 }
 
@@ -105,7 +232,7 @@ static void installHook(int attempt) {
                     @selector(sc_openFrontmostApplicationAsSplitFromSourceRect:),
                     (IMP)hook_openFrontmostAsSplit,
                     (IMP *)&orig_openFrontmostAsSplit);
-    SC_LOG(@"hooked (normal floating, no dock)");
+    SC_LOG(@"hooked (mode=%s)", sc_freeFloatMode() ? "free-float(1)" : "dock(0)");
 }
 
 %ctor {
