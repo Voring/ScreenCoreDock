@@ -1,92 +1,6 @@
-//
-//  Tweak.xm
-//  ScreenCoreDock  v0.2.2
-//
-//  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
-//  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
-//
-//  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
-//  (system-tool:fullscreen-to-screencore-split)
-//  由「前台应用 -> 分屏浮窗（居中大窗口）」改为「前台应用 -> 侧贴浮窗（贴屏幕两侧的小卡片）」。
-//
-//  逆向依据（ScreenCore.dylib 2.0.5 arm64 切片，未滑动虚拟地址，详见 README.md）：
-//    _SCFullscreenToSplitToolPerform            0x113a4
-//      -> -[SCFloatingSceneManager sc_openFrontmostApplicationAsSplitFromSourceRect:]  0x48eb8
-//         -> -[SCFloatingSceneManager sc_openSplitForBundleIdentifier:presentationSourceRect:]  0x46cf4
-//            -> ... 0x47f60 （创建 SCFloatingSceneSession，按 normalFrame 呈现）
-//  这条链路里没有任何 dock 调用，所以窗口必定是「分屏浮窗」。
-//  本 tweak 在原方法返回后取 activeSession 补一次 dock，使其落成「侧贴浮窗」。
-//
-//  v0.1.8：横屏修复（放开 sc_dockSession:fromCorner: 的方向守卫）
-//  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
-//  v0.2.0：横屏卡片过大，按 0.5 缩放并重排
-//  v0.2.1：横屏可点四角进侧贴；横屏左右间距对齐，顶部再加一个状态栏高度
-//  v0.2.2：修安全模式 —— 不再在初始化时遍历全类表，改为按类名取 SCFloatingContainerView
-//
-//    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
-//
-//        0x42ec0  cmp   x26, #1          ; x26 = 新方向 - 3
-//        0x42ec4  b.hi  0x42eec          ; 非横屏跳过
-//        0x42ee0  bl    sc_restoreAllDockedSessionsAnimated:   ; 横屏 -> 全部收回
-//
-//    也就是只要方向变成横屏(3/4)，dockManager 会把所有已侧贴的 session 全部
-//    restore 回普通浮窗，结果就是「横屏不允许悬挂侧贴」。
-//    修法：hook SCFloatingSceneManager -sc_activeHostOrientationDidChange:duration:
-//    打一个「方向切换进行中」标记，再 hook SCFloatingDockManager
-//    -sc_restoreAllDockedSessionsAnimated:，当标记为真且 hostOrientation >= 3 时放行保留。
-//    手动「全部收回」等其它调用不在此期间，照常执行。
-//
-//  v0.1.8 细节：
-//
-//    -[SCFloatingSceneManager sc_dockSession:fromCorner:]（0x463ac）进函数后立刻
-//    校验 host 方向：
-//
-//        0x463e0  bl    activeHostOrientation
-//        0x463e4  sub   x8, x0, #1
-//        0x463e8  cmp   x8, #1
-//        0x463ec  b.hi  -> 0x46518      ; 直接 return NO
-//
-//    也就是只接受 1(竖屏) / 2(倒竖屏)，横屏(3/4)直接返回 NO，什么都不做。
-//    而它下层的 DockManager 同名方法（0x3bde4）没有方向判断，只校验
-//    normalFrame 是否合法（0x3b0a0：非 null、非空、宽高 > 1），通过就把
-//    record 建出来、setFrame、addSubview、setDisplayState、setDocked。
-//
-//    所以横屏侧贴不了，卡点只在 manager 这一层的方向守卫。
-//    修法：hook -sc_dockSession:fromCorner:，原方法返回 NO 且当前是横屏时，
-//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法，让插件自己
-//    走完整的侧贴流程；仍失败则直接走 DockManager 层的同名方法兜底。
-//
-//    副作用说明：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
-//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位。
-//    这只影响下次旋转回来时的还原位置，不影响当次侧贴。
-//
-
-#import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <substrate.h>
-
-#define SC_DOMAIN CFSTR("com.susudear.screencore")
-#define SC_LOG(fmt, ...) NSLog(@"[ScreenCoreDock] " fmt, ##__VA_ARGS__)
-
-// 只做声明，不提供实现；运行时类由 ScreenCore.dylib 提供。
-// corner：1 = 一侧，2 = 另一侧（插件内部 sc_dockSessionForSingleActiveWindow: 就是这么映射的）
-@interface SCFloatingSceneManager : NSObject
-- (BOOL)sc_openFrontmostApplicationAsSplitFromSourceRect:(CGRect)rect;
-- (id)activeSession;
-- (id)dockManager;
-- (NSInteger)activeHostOrientation;   // 1 竖屏 / 2 倒竖屏 / 3、4 横屏
-- (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
-- (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
-@end
-
-@interface SCFloatingSceneManager (Orientation)
-- (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
-@end
-
-// sceneManager 的委托方法，横屏点角时要手动转发给它
 @interface NSObject (SCDockFromCornerForwarding)
 - (void)sc_floatingContainerView:(id)view didRequestDockFromCorner:(NSInteger)corner;
+- (id)sc_sessionForContainerView:(id)view;
 @end
 
 @interface SCFloatingDockManager : NSObject
@@ -169,7 +83,6 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
 
 #pragma mark - 横屏保留侧贴
 
-// 方向切换期间打标记，供 restoreAll 判断是不是「转入横屏」触发的强制收回
 static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, double duration) {
     sc_inOrientationChange = YES;
     @try {
@@ -179,7 +92,6 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
     }
     SC_LOG(@"orientation change -> %ld done", (long)orientation);
 
-    // 转进横屏后补一次侧边布局，让 hook_targetFramesForSide 的缩放帧真正落地
     if (orientation >= 3) {
         id dock = nil;
         @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
@@ -202,7 +114,6 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
     }
 }
 
-// 插件在转入横屏时会调它把全部侧贴收回（0x42ec0/0x42ee0），这里放行保留
 static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
     if (sc_inOrientationChange) {
         NSInteger host = 0;
@@ -222,8 +133,6 @@ static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
 
 #pragma mark - 横屏缩小卡片
 
-// 横屏顶部要多留的量：优先读插件自己的 splitPortraitTopSpacing，
-// 其次取系统状态栏高度，都没有就按 44 兜底。
 static CGFloat sc_statusBarHeight(void) {
     NSNumber *n = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
         CFSTR("splitPortraitTopSpacing"), SC_DOMAIN);
@@ -237,7 +146,6 @@ static CGFloat sc_statusBarHeight(void) {
     return h;
 }
 
-// 横屏下卡片尺寸：默认各边各缩一半（面积 1/4），可用偏好 LandscapeDockScale 调
 static CGFloat sc_landscapeScale(void) {
     CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("LandscapeDockScale"),
                                                     CFSTR("com.voring.screencoredock"));
@@ -253,9 +161,6 @@ static CGFloat sc_landscapeScale(void) {
     return s;
 }
 
-// 横屏卡片变巨大的根因：targetFramesForSide 用 record 的 normalFrame 高/宽比推高度
-// (0x3a650~0x3a668)，而横屏下这个比例仍是竖屏的，算出来接近整屏高。
-// 这里在横屏时按比例重算尺寸并自上而下重新紧凑堆叠。
 static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
     NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
     if (frames.count == 0 || sc_forcePortrait) return frames;
@@ -263,7 +168,7 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
     NSInteger host = 0;
     @try { host = [(SCFloatingDockManager *)self hostOrientation]; }
     @catch (__unused NSException *e) {}
-    if (host < 3) return frames;   // 竖屏完全走原逻辑
+    if (host < 3) return frames;
 
     CGRect bounds = CGRectZero;
     @try {
@@ -283,11 +188,10 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
     if (keys.count == 0) return frames;
     CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
-    // 插件左右边距本身是 8pt（0x3aaec / 0x3aaf8）。
-    // 横屏下保持右侧那个视觉间距（8 + 缩掉的一半宽度），左侧照抄同一值；
-    // 顶部在这个间距上再加一个状态栏高度，避免贴边太突兀。
+    // 横屏下保持右侧那个视觉间距（8 + 缩掉的一半宽度），左侧照抄同一值。
+    // 顶部只取该间距的 1/4（v0.2.3 按反馈缩短），不再叠整段状态栏高度。
     CGFloat margin = 8.0 + first.size.width * (1.0 - scale);
-    CGFloat topGap = margin + sc_statusBarHeight();
+    CGFloat topGap = (margin + sc_statusBarHeight()) * 0.25;
     BOOL isRight = (CGRectGetMidX(first) > CGRectGetMidX(bounds));
     CGFloat y = CGRectGetMinY(bounds) + topGap;
     CGFloat gap = 18.0 * scale;
@@ -312,9 +216,6 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
 #pragma mark - 横屏点角落进侧贴
 
-// 插件 -[SCFloatingContainerView sc_handleDockTap:]（0x386b0）在 0x38738 处比较容器 bounds：
-// 宽 > 高（横屏）就直接 return，四角落点按不发请求。
-// 竖屏仍走原方法；横屏复刻原方法末尾那一步，交给 sceneManager 去 dock。
 static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
     UIView *superview = nil;
     @try { superview = [self superview]; }
@@ -325,22 +226,23 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
         return;
     }
 
+    SC_LOG(@"landscape dock tap enter, superview=%@", NSStringFromCGRect(superview.bounds));
+
     BOOL docked = NO;
     @try {
         if ([self respondsToSelector:@selector(isDocked)]) {
             docked = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isDocked));
         }
     } @catch (__unused NSException *e) {}
-    if (docked) return;
+    if (docked) {
+        SC_LOG(@"landscape dock tap: already docked, ignore");
+        return;
+    }
 
     id delegate = nil;
     @try {
         if ([self respondsToSelector:@selector(delegate)]) delegate = [self delegate];
     } @catch (__unused NSException *e) {}
-    if (![delegate respondsToSelector:@selector(sc_floatingContainerView:didRequestDockFromCorner:)]) {
-        SC_LOG(@"landscape dock tap: delegate(%@) can't dock", [delegate class]);
-        return;
-    }
 
     NSInteger corner = 0;
     @try {
@@ -349,17 +251,48 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
             corner = ((NSInteger (*)(id, SEL))objc_msgSend)(tapView, @selector(tag));
         }
     } @catch (__unused NSException *e) {}
-    if (corner <= 0) {
-        SC_LOG(@"landscape dock tap: no corner tag, skip");
+    SC_LOG(@"landscape dock tap corner=%ld delegate=%@", (long)corner, [delegate class]);
+    if (corner <= 0) return;
+
+    if ([delegate respondsToSelector:@selector(sc_floatingContainerView:didRequestDockFromCorner:)]) {
+        @try {
+            [(NSObject *)delegate sc_floatingContainerView:self didRequestDockFromCorner:corner];
+        } @catch (NSException *e) {
+            SC_LOG(@"landscape dock tap forward threw %@", e.reason);
+        }
+    }
+
+    // 转发后仍未落成侧贴时，直接按 session 补一次 dock（走已 hook 的 sc_dockSession:fromCorner:）
+    BOOL now = NO;
+    @try {
+        if ([self respondsToSelector:@selector(isDocked)]) {
+            now = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isDocked));
+        }
+    } @catch (__unused NSException *e) {}
+    if (now) {
+        SC_LOG(@"landscape dock tap ok via forward");
         return;
     }
 
-    SC_LOG(@"landscape dock tap corner=%ld, forward to sceneManager", (long)corner);
+    id session = nil;
     @try {
-        [(NSObject *)delegate sc_floatingContainerView:self didRequestDockFromCorner:corner];
+        if ([delegate respondsToSelector:@selector(sc_sessionForContainerView:)]) {
+            session = [(NSObject *)delegate sc_sessionForContainerView:self];
+        }
     } @catch (NSException *e) {
-        SC_LOG(@"landscape dock tap threw %@", e.reason);
+        SC_LOG(@"landscape dock tap session lookup threw %@", e.reason);
     }
+    if (!session) {
+        SC_LOG(@"landscape dock tap: no session for container");
+        return;
+    }
+    BOOL ok = NO;
+    @try {
+        ok = [(SCFloatingSceneManager *)delegate sc_dockSession:session fromCorner:corner];
+    } @catch (NSException *e) {
+        SC_LOG(@"landscape dock tap dock threw %@", e.reason);
+    }
+    SC_LOG(@"landscape dock tap direct dock corner=%ld ok=%d", (long)corner, ok);
 }
 
 #pragma mark - 入口
@@ -379,7 +312,6 @@ static void sc_dockSessionIfPossible(SCFloatingSceneManager *manager) {
         SC_LOG(@"sc_dockSession:fromCorner: threw %@", e.reason);
     }
     if (!docked) {
-        // 兜底：走插件自己的「单窗口侧贴」封装（内部会再判 isLiveSession / isSessionDocked）
         @try {
             docked = [manager sc_dockSessionForSingleActiveWindow:session];
         } @catch (NSException *e) {
@@ -405,7 +337,6 @@ static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
 static void installHook(int attempt) {
     Class cls = objc_getClass("SCFloatingSceneManager");
     if (!cls) {
-        // ScreenCore.dylib 可能比本 tweak 后加载，短暂重试
         if (attempt >= 50) {
             SC_LOG(@"SCFloatingSceneManager not found, hook aborted");
             return;
@@ -427,7 +358,6 @@ static void installHook(int attempt) {
                     (IMP)hook_dockSession,
                     (IMP *)&orig_dockSession);
 
-    // 只有 manager 这一层有方向守卫，改它的返回值即可
     if ([cls instancesRespondToSelector:@selector(activeHostOrientation)]) {
         MSHookMessageEx(cls,
                         @selector(activeHostOrientation),
@@ -435,7 +365,6 @@ static void installHook(int attempt) {
                         (IMP *)&orig_activeHostOrientation);
     }
 
-    // 转入横屏时插件会强制收回全部侧贴，挂方向切换入口和收回方法
     if ([cls instancesRespondToSelector:@selector(sc_activeHostOrientationDidChange:duration:)]) {
         MSHookMessageEx(cls,
                         @selector(sc_activeHostOrientationDidChange:duration:),
@@ -457,9 +386,6 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    // 横屏点四角：直接按类名取（SCFloatingContainerView 同时实现
-    // sc_handleDockTap: / isDocked / delegate），不再遍历全类表，
-    // 避免初始化阶段 messaging 未 realize 的类导致安全模式。
     Class containerCls = objc_getClass("SCFloatingContainerView");
     if (containerCls && [containerCls instancesRespondToSelector:@selector(sc_handleDockTap:)]) {
         MSHookMessageEx(containerCls,
