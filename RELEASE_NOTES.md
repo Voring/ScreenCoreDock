@@ -75,3 +75,5 @@ left gesture region tapped, close floating window instead of fullscreen
 - v0.2.1 横屏左右间距对齐；
 - v0.2.3 横屏顶部间距 1/4；
 - v0.3.0 移除四角监听与点角链路。
+
+<!-- trigger re-release to refresh release body -->
