@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.2.0
+//  ScreenCoreDock  v0.2.1
 //
 //  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
 //  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
@@ -19,21 +19,21 @@
 //
 //  v0.1.8：横屏修复（放开 sc_dockSession:fromCorner: 的方向守卫）
 //  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
-//  v0.2.0：横屏卡片过大，按比例缩到 1/4 面积并重新紧凑堆叠
+//  v0.2.0：横屏卡片过大，按 0.5 缩放并重排
+//  v0.2.1：横屏可点四角进侧贴；横屏四向边距统一 8pt
 //
-//    v0.1.9 限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
+//    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
 //
 //        0x42ec0  cmp   x26, #1          ; x26 = 新方向 - 3
 //        0x42ec4  b.hi  0x42eec          ; 非横屏跳过
 //        0x42ee0  bl    sc_restoreAllDockedSessionsAnimated:   ; 横屏 -> 全部收回
 //
-//    修法：方向切换期间打标记，hook SCFloatingDockManager
-//    -sc_restoreAllDockedSessionsAnimated:，标记为真且 hostOrientation >= 3 时放行保留。
-//
-//    v0.2.0 尺寸根因：-sc_targetFramesForSide:（0x3a384）宽度 = hostWidth * 0.23
-//    （夹在 [88,170]），高度 = 宽度 * record.normalFrame 的高/宽比（0x3a650~0x3a668）。
-//    横屏下 normalFrame 仍是竖屏比例，高度就被推成接近整屏高。
-//    修法：横屏时按 scale 缩小宽高并重新自上而下紧凑堆叠（x 沿用插件贴边位置）。
+//    也就是只要方向变成横屏(3/4)，dockManager 会把所有已侧贴的 session 全部
+//    restore 回普通浮窗，结果就是「横屏不允许悬挂侧贴」。
+//    修法：hook SCFloatingSceneManager -sc_activeHostOrientationDidChange:duration:
+//    打一个「方向切换进行中」标记，再 hook SCFloatingDockManager
+//    -sc_restoreAllDockedSessionsAnimated:，当标记为真且 hostOrientation >= 3 时放行保留。
+//    手动「全部收回」等其它调用不在此期间，照常执行。
 //
 //  v0.1.8 细节：
 //
@@ -50,13 +50,14 @@
 //    normalFrame 是否合法（0x3b0a0：非 null、非空、宽高 > 1），通过就把
 //    record 建出来、setFrame、addSubview、setDisplayState、setDocked。
 //
+//    所以横屏侧贴不了，卡点只在 manager 这一层的方向守卫。
 //    修法：hook -sc_dockSession:fromCorner:，原方法返回 NO 且当前是横屏时，
-//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法；仍失败则直接
-//    走 DockManager 层的同名方法兜底。
+//    临时把 activeHostOrientation 顶成 1（竖屏）后重入一次原方法，让插件自己
+//    走完整的侧贴流程；仍失败则直接走 DockManager 层的同名方法兜底。
 //
-//    副作用：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
-//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位，
-//    仅影响下次旋转回来时的还原位置。
+//    副作用说明：重入时 sc_saveFrame:forSession:forHostOrientation:contentOrientation:
+//    会把当前帧按「竖屏」key 记下来，因此横屏下的记忆帧归到竖屏档位。
+//    这只影响下次旋转回来时的还原位置，不影响当次侧贴。
 //
 
 #import <Foundation/Foundation.h>
@@ -232,7 +233,7 @@ static CGFloat sc_landscapeScale(void) {
 
 // 横屏卡片变巨大的根因：targetFramesForSide 用 record 的 normalFrame 高/宽比推高度
 // (0x3a650~0x3a668)，而横屏下这个比例仍是竖屏的，算出来接近整屏高。
-// 这里在横屏时按比例重算尺寸并自上而下重新紧凑堆叠，x 沿用插件算好的贴边位置。
+// 这里在横屏时按比例重算尺寸并自上而下重新紧凑堆叠。
 static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side) {
     NSDictionary *frames = orig_targetFramesForSide(self, _cmd, side);
     if (frames.count == 0 || sc_forcePortrait) return frames;
@@ -260,7 +261,11 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
     if (keys.count == 0) return frames;
     CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
-    CGFloat y = CGRectGetMinY(first);
+    // 插件左右边距都是 8pt（0x3aaec / 0x3aaf8），横屏下顶部 inset 被算成 0，
+    // 这里统一成上下左右都用同一个 8pt 边距，不改插件逻辑。
+    CGFloat margin = 8.0;
+    BOOL isRight = (CGRectGetMidX(first) > CGRectGetMidX(bounds));
+    CGFloat y = CGRectGetMinY(bounds) + margin;
     CGFloat gap = 18.0 * scale;
 
     NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:keys.count];
@@ -270,13 +275,69 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
         if (CGRectGetMaxY(bounds) - y < size.height) {
             y = MAX(CGRectGetMinY(bounds), CGRectGetMaxY(bounds) - size.height);
         }
-        CGRect nr = CGRectMake(old.origin.x, y, size.width, size.height);
+        CGFloat x = isRight ? (CGRectGetMaxX(bounds) - margin - size.width)
+                            : (CGRectGetMinX(bounds) + margin);
+        CGRect nr = CGRectMake(x, y, size.width, size.height);
         out[key] = [NSValue valueWithCGRect:nr];
         y = CGRectGetMaxY(nr) + gap;
         SC_LOG(@"landscape frames side=%ld scale=%.2f %@ -> %@", (long)side, scale,
                NSStringFromCGRect(old), NSStringFromCGRect(nr));
     }
     return out;
+}
+
+#pragma mark - 横屏点角落进侧贴
+
+// 插件 -sc_handleDockTap:（0x386b0）在 0x38738 处比较容器 bounds：
+// 宽 > 高（横屏）就直接 return，四角落点按不发请求。
+// 竖屏仍走原方法；横屏复刻原方法末尾那一步，交给 sceneManager 去 dock。
+static void (*orig_handleDockTap)(id, SEL, id);
+
+static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
+    UIView *superview = nil;
+    @try { superview = [self superview]; }
+    @catch (__unused NSException *e) {}
+
+    if (!superview || CGRectGetWidth(superview.bounds) <= CGRectGetHeight(superview.bounds)) {
+        orig_handleDockTap(self, _cmd, gesture);
+        return;
+    }
+
+    BOOL docked = NO;
+    @try {
+        if ([self respondsToSelector:@selector(isDocked)]) {
+            docked = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isDocked));
+        }
+    } @catch (__unused NSException *e) {}
+    if (docked) return;
+
+    id delegate = nil;
+    @try {
+        if ([self respondsToSelector:@selector(delegate)]) delegate = [self delegate];
+    } @catch (__unused NSException *e) {}
+    if (![delegate respondsToSelector:@selector(sc_floatingContainerView:didRequestDockFromCorner:)]) {
+        SC_LOG(@"landscape dock tap: delegate(%@) can't dock", [delegate class]);
+        return;
+    }
+
+    NSInteger corner = 0;
+    @try {
+        UIView *tapView = (UIView *)((id (*)(id, SEL))objc_msgSend)(gesture, @selector(view));
+        if ([tapView respondsToSelector:@selector(tag)]) {
+            corner = ((NSInteger (*)(id, SEL))objc_msgSend)(tapView, @selector(tag));
+        }
+    } @catch (__unused NSException *e) {}
+    if (corner <= 0) {
+        SC_LOG(@"landscape dock tap: no corner tag, skip");
+        return;
+    }
+
+    SC_LOG(@"landscape dock tap corner=%ld, forward to sceneManager", (long)corner);
+    @try {
+        [(id)delegate sc_floatingContainerView:self didRequestDockFromCorner:corner];
+    } @catch (NSException *e) {
+        SC_LOG(@"landscape dock tap threw %@", e.reason);
+    }
 }
 
 #pragma mark - 入口
@@ -374,7 +435,26 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames)");
+    // 横屏点四角：按选择器找到那个视图类再挂（类名未导出）
+    int classCount = (int)objc_getClassList(NULL, 0);
+    if (classCount > 0) {
+        Class *classes = (Class *)calloc((size_t)classCount, sizeof(Class));
+        classCount = (int)objc_getClassList(classes, classCount);
+        for (int i = 0; i < classCount; i++) {
+            Class c = classes[i];
+            if ([c instancesRespondToSelector:@selector(sc_handleDockTap:)] &&
+                [c instancesRespondToSelector:@selector(cornerResizeTouchRegions)]) {
+                MSHookMessageEx(c,
+                                @selector(sc_handleDockTap:),
+                                (IMP)hook_handleDockTap,
+                                (IMP *)&orig_handleDockTap);
+                SC_LOG(@"hooked sc_handleDockTap: on %@", c);
+            }
+        }
+        free(classes);
+    }
+
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + dockTap)");
 }
 
 %ctor {
