@@ -1,71 +1,85 @@
-# ScreenCoreDock v0.2.3
+# ScreenCoreDock v0.2.4
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.2.3`
+- 版本：`0.2.4`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
 ## 改动说明
 
-本版两件事：横屏点四角补 session 兜底；顶部间距缩到 1/4。
+顶部位置已修好，本版只处理横屏点四角仍不进侧贴。
 
-### 横屏点四角仍然无效（本版补兜底 + 日志）
+### 已验证的链路（反汇编确认）
 
-v0.2.2 已确认 hook 挂上 `SCFloatingContainerView -sc_handleDockTap:`（日志有 `hooked sc_handleDockTap: on SCFloatingContainerView`），但横屏点角仍无反应，说明「转发给 delegate」这一步没有真的把窗口落成侧贴。
-
-原方法末尾那一步是：
+四角落的 tap 手势是 `sc_addResizeGestureToRegion:corner:`（0x34564）装的：
 
 ```
-0x3878c  [self sc_notifyActivationRequested]
-0x38794  delegate
-0x387a8  [[gesture view] tag]      ; corner
-0x387cc  [delegate sc_floatingContainerView:self didRequestDockFromCorner:corner]
+0x3458c  setTag:          ; region view 的 tag = corner (1..4)
+0x345a0  ldr x3,[0xab080]  ; sc_handleResizeGesture:
+0x345a8  initWithTarget:action:   ; target = container
+0x345b0  setMaximumNumberOfTouches:1
+0x345c0  addGestureRecognizer:
+0x345d4  ldr x3,[0xab088]  ; sc_handleDockTap:
+0x345dc  initWithTarget:action:
+0x345e8  setNumberOfTapsRequired:1
+0x345f4  requireGestureRecognizerToFail:   ; tap 需要 pan 失败
+0x34600  addGestureRecognizer:
 ```
 
-本版在横屏分支里改成三段：
+即：点角落 -> `[container sc_handleDockTap:]`，target 就是容器本身，选择器也对得上 hook。
 
-1. 先照原样转发 `sc_floatingContainerView:didRequestDockFromCorner:`；
-2. 转发后回读 `isDocked`，如果没变成侧贴，则用 `sc_sessionForContainerView:` 取该容器对应的 session（`SCFloatingSceneManager` 确实有这个方法）；
-3. 拿到 session 后直接 `sc_dockSession:fromCorner:`，也就是走已 hook 的那条路径（横屏会被顶成竖屏重入 + DockManager 兜底）。
+而转发后的 delegate 方法 `sc_floatingContainerView:didRequestDockFromCorner:`（0x4931c）内部是：
 
-同时补了三行诊断日志，横屏点角时依次会打出：
+```
+isMainThread -> sc_sessionForContainerView: -> sc_isLiveSession: -> sc_dockSession:fromCorner: -> sc_activateSession:
+```
+
+任何一步不满足就静默什么都不做。
+
+### 本版改法
+
+v0.2.3 在转发失败后会取 `sc_sessionForContainerView:` 再 dock。本版再补一层：如果这个容器查不到 session，就改用 `activeSession`：
+
+```objc
+id session = [delegate sc_sessionForContainerView:self];
+if (!session) session = [delegate activeSession];
+```
+
+然后直接 `sc_dockSession:fromCorner:`（横屏会被顶成竖屏重入 + DockManager 兜底）。
+
+同时把失败点都打出来：
 
 ```
 landscape dock tap enter, superview={{0, 0}, {852, 393}}
 landscape dock tap corner=N delegate=SCFloatingSceneManager
-landscape dock tap ok via forward        <- 或 direct dock corner=N ok=1
+landscape dock tap ok via forward
+landscape dock tap: container has no session, fall back to activeSession=SCFloatingSceneSession
+landscape dock tap direct dock corner=N ok=1
+landscape dock tap: no session at all
 ```
 
-如果**一条都没打**，说明点击根本没进到 `sc_handleDockTap:`（那问题在四角落手势是否在横屏下被安装/命中，方向不同）。
+### 如果还是不行
 
-### 横屏顶部间距过大（本版缩到 1/4）
+看日志分两种情况：
 
-v0.2.1 的顶部间距是 `margin + 状态栏高度`，`margin = 8 + 旧宽 × (1 - scale)` 在横向约 93pt，叠上状态栏约 47pt，实际顶部空出约 140pt，太远。
+1. **一行 `landscape dock tap` 都没有** —— 点击没进到 `sc_handleDockTap:`。那就是横屏下四角 region 没被布局/命中的问题（不是 dock 层），需要改从 `sc_layoutExternalInteractionRegions` 下手；
+2. **有 `enter` 但 `ok=0` 或 `no session at all`** —— dock 层被拒，按日志里的 session 类型继续拆。
 
-本版改为：
+## 保留的既有改动
 
-```objc
-CGFloat topGap = (margin + sc_statusBarHeight()) * 0.25;   // 约 35pt
-```
-
-左右间距保持不变（仍是横屏右侧那个视觉间距，左侧同值）。
-
-### 保留的既有改动
-
-- v0.1.8 放开 `sc_dockSession:fromCorner:` 的横屏方向守卫；
-- v0.1.9 转入横屏不再强制收回侧贴；
+- v0.1.0 基线：打开分屏后补一次 dock；
+- v0.1.8 放开 `sc_dockSession:fromCorner:` 横屏方向守卫；
+- v0.1.9 转入横屏不强制收回侧贴；
 - v0.2.0 横屏卡片 0.5 缩放 + 紧凑重排（`LandscapeDockScale`）；
-- v0.2.1 横屏点角转发 + 左右间距对齐；
-- v0.2.2 不再遍历全类表，按类名 hook，修安全模式。
+- v0.2.1 横屏左右间距对齐；
+- v0.2.2 修安全模式（不再遍历全类表）；
+- v0.2.3 顶部间距缩到 1/4。
 
 ## 真机验证
 
 ```sh
 log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'
 ```
-
-1. 转横屏：应看到 `landscape frames side=1 ...` 与 `landscape frames side=2 ...`，顶部气泡明显上移（约 35pt）；
-2. 横屏点浮窗四角：看是否打出 `landscape dock tap enter`。打出但 `ok=0`，把这几行发我；一条都没打，也请说明，那就是手势层问题而不是 dock 层问题。
