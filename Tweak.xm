@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.3
+//  ScreenCoreDock  v0.3.4
 //
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
 //  (system-tool:fullscreen-to-screencore-split)
@@ -201,26 +201,27 @@ static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
     if (orig_handleFullscreenTap) orig_handleFullscreenTap(self, _cmd, gesture);
 }
 
-#pragma mark - 通知中心下拉时保留侧贴（v0.3.3）
+#pragma mark - 通知中心下拉时保留侧贴（v0.3.4）
 
-// 通知中心 = SpringBoard 的 CoverSheet。v0.3.2 只读了 isCoverSheetPresented，
-// 实测日志里 coverSheet 恒为 0：可能是类名/sharedInstance/getter 名与预期不符。
-// 本版：缓存 manager、依次尝试多个 getter、启动时把探测结果写进日志。
+// 崩溃原因（v0.3.3 真机 ips）：启动早期就调 +[SBCoverSheetPresentationManager sharedInstance]，
+// 其 init 里建震动反馈生成器，环境未就绪直接 abort（SIGABRT，@try 拦不住）。
+// 本版：启动时不碰 sharedInstance；延迟 5 秒后才允许查询，且只在 hook 触发时懒加载。
+
+static BOOL sc_coverQueryAllowed = NO;
 
 static id sc_coverSheetManager(void) {
     static Class csCls = Nil;
     static id cachedMgr = nil;
     static BOOL looked = NO;
+    if (!sc_coverQueryAllowed) return nil;
     if (!looked) {
         looked = YES;
         csCls = objc_getClass("SBCoverSheetPresentationManager");
         if (csCls) {
-            @try {
-                SEL shared = NSSelectorFromString(@"sharedInstance");
-                if ([csCls respondsToSelector:shared]) {
-                    cachedMgr = ((id (*)(id, SEL))objc_msgSend)((id)csCls, shared);
-                }
-            } @catch (__unused NSException *e) {}
+            SEL shared = NSSelectorFromString(@"sharedInstance");
+            if ([csCls respondsToSelector:shared]) {
+                cachedMgr = ((id (*)(id, SEL))objc_msgSend)((id)csCls, shared);
+            }
         }
     }
     return cachedMgr;
@@ -245,16 +246,21 @@ static BOOL sc_coverSheetPresented(void) {
 static void sc_dumpCoverSheetDiagnostics(void) {
     Class cs = objc_getClass("SBCoverSheetPresentationManager");
     SC_LOG(@"coverSheet class=%@", cs ? NSStringFromClass(cs) : @"nil");
-    id mgr = sc_coverSheetManager();
-    SC_LOG(@"coverSheet manager=%@", mgr ? NSStringFromClass(mgr) : @"nil");
-    if (!mgr) return;
-    for (NSString *name in sc_coverSheetGetters()) {
-        SEL s = NSSelectorFromString(name);
-        BOOL resp = [mgr respondsToSelector:s];
-        int val = -1;
-        if (resp) val = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s);
-        SC_LOG(@"coverSheet getter %@ responds=%d value=%d", name, (int)resp, val);
-    }
+    // sharedInstance 延迟到 5 秒后再探，避免启动早期 abort
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        sc_coverQueryAllowed = YES;
+        id mgr = sc_coverSheetManager();
+        SC_LOG(@"coverSheet manager=%@", mgr ? NSStringFromClass(mgr) : @"nil");
+        if (!mgr) return;
+        for (NSString *name in sc_coverSheetGetters()) {
+            SEL s = NSSelectorFromString(name);
+            BOOL resp = [mgr respondsToSelector:s];
+            int val = -1;
+            if (resp) val = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s);
+            SC_LOG(@"coverSheet getter %@ responds=%d value=%d", name, (int)resp, val);
+        }
+    });
 }
 
 static void hook_undockSession(id self, SEL _cmd, id session, BOOL animated) {
@@ -562,12 +568,12 @@ static void installHook(int attempt) {
     }
 
     sc_dumpCoverSheetDiagnostics();
-    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet v3)");
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet v4)");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.3 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.4 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
