@@ -1,61 +1,50 @@
-# ScreenCoreDock v0.1.4
+# ScreenCoreDock v0.1.5
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.1.4`
-- 架构：`iphoneos-arm64`（fat，含 arm64 + arm64e 切片）
+- 版本：`0.1.5`
+- 架构：`iphoneos-arm64`（fat，arm64 + arm64e 切片）
 - 打包方案：`roothide`
 
-## 本版要解决的 bug（v0.1.3 已装的可直接升级）
+## 本版改动
 
-**症状**：侧贴卡片拖离两侧边缘后，卡片被放大到覆盖大半个屏幕。
+放弃「侧贴卡片自由摆放」这条路线，**移除全部侧贴（dock）排列相关逻辑**，打开后保持原生普通浮窗状态（displayState 3），沿用插件原生的拖动 / 缩放 / 记忆位置能力。
 
-**原因**：v0.1.3 把“自由位置”存成了一个完整的 `CGRect`，其中尺寸是用 `record.normalFrame` 推的。
-`-sc_applyFrame:toRecord:` 内部会调 `-sc_dockTransformForRecord:targetFrame:`，这个函数按
-「目标帧尺寸 ÷ normalFrame 尺寸」算视觉缩放。一旦我们给的尺寸大于 real 尺寸（normalFrame 为零或异常时就会发生），
-缩放比就被放大，卡片直接糊满屏。
+### 为什么放弃侧贴路线（v0.1.0 ~ v0.1.4 反复验证结论）
 
-**修法**：自由位置只存**一个中心点**，尺寸一律沿用插件自己算好的槽位尺寸。
+侧贴是一套独立布局模型：record 的坐标 = f(side, order)。拖拽结束会经过
+`sc_moveDraggingRecord:toSide:center:` → `sc_updateNormalizedYForOrder:` →
+`sc_layoutSide:animated:completion:` → `sc_targetFramesForSide:` → `sc_applyFrame:toRecord:`，
+另外 `sc_dockedFloatingItemView:didMoveToCenter:state:velocity:` 收尾层还会内联按槽位夹紧 x/y 并直接 `setCenter:`，
+绕过 applyFrame。硬改槽位会在两层之间被反复拉回边缘，表现为：只能沿中轴线移动、左右闪烁、回不到两侧、离边后尺寸失控放大。
+这套模型与「任意位置自由摆放」目标冲突，继续 hook 性价比很低，故整体下线。
 
-- `-sc_targetFramesForSide:`：把槽位 **平移**到该中心（尺寸不变）；
-- `-sc_applyFrame:toRecord:`：兜底时只改原点，不碰 size；
-- 新增 `sc_clampCenter`：中心点夹在 host 内，保证整张卡片不越界。
+### 本版实现
 
-## 完整交互规则
-
-- **松手贴近左/右边缘**（默认 90pt 内）→ 清除自由位置，回原插件侧贴槽位吸附（按顺序排列）；
-- **松手偏离两侧边缘** → 卡片停在落点，任意位置自由摆放，不再回槽位；
-- 卡片**尺寸不变**（插件本身不提供调整大小）；
-- 自由位置不持久化，record 销毁后回槽位。
-
-阈值在 `Tweak.xm` 顶部：`#define SC_EDGE_SNAP_INSET 90.0`。
-
-## 安装
-
-1. 已安装 ScreenCore 2.0.5；
-2. 安装 roothide deb（覆盖升级会自动替换旧版）；
-3. respring 或重启 SpringBoard。
+- 只保留入口 hook：`-sc_openFrontmostApplicationAsSplitFromSourceRect:`；
+- 打开后**不再调用** `sc_dockSession:fromCorner:`（之前用来切到侧贴 state 1）；
+- 主动把容器 `setDisplayState:3`（普通浮窗），确认不进侧贴；
+- 删除 v0.1.2 ~ v0.1.4 的三枚布局 hook（targetFramesForSide / moveDraggingRecord / applyFrame）与自由位置关联对象。
 
 ## 验证与日志
 
-`log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'`
+```
+log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'
+```
 
 应看到：
 
-- `hooked (mode=2, dockClass=..., edgeInset=90)`
-- 拖动中间松手：`drop free (side=..., center=...)`
-- 拖回边缘松手：`drop near edge (...) -> snap to slot`
-- 重排时：`free center applied for record ... -> {...} (slot {...})` —— 两者尺寸应一致
-- `applyFrame moved {...} -> {...}` —— 新旧 rect 尺寸应一致
+- `hooked (normal floating, no dock)`
+- `session=... container=... displayState <x> -> 3 (normal floating)`
 
-**如果尺寸还是变大**：把 `applyFrame moved` 与 `free center applied` 两行日志的 rect 发我，能直接看出是哪一层尺寸不对。
+**请重点反馈**：打开后的窗口能否在屏幕任意位置自由拖动、能否调整大小。
+如果拖不动（仍是半屏分屏），说明该入口创建的不是可拖动浮窗，需要再找「提升为浮窗」的路径；把上面两行日志发我即可定位。
 
 ## 已知限制
 
-- 拖到屏幕外侧（插件判定为“向外拖关闭”）仍会关闭，本版未改。
-- 多个卡片各自自由摆放，但 z 序仍由插件按 order 维护。
-- 竖直方向如仍被限制在边缘竖条内，说明 `didMoveToCenter` 收尾处还有一层内联 y 向夹紧，需再加 hook。
+- 本版不再做侧贴小卡片外观；窗口尺寸为插件默认值。
+- 若原生普通浮窗本身被限制拖动，本 hook 不额外改造拖拽行为。
 
 ## 逆向备忘（arm64 切片，未滑动地址）
 
@@ -64,12 +53,7 @@
 | `0x113a4` | `_SCFullscreenToSplitToolPerform` |
 | `0x48eb8` | `-sc_openFrontmostApplicationAsSplitFromSourceRect:` |
 | `0x46cf4` | `-sc_openSplitForBundleIdentifier:presentationSourceRect:` |
-| `0x43c1c` | `-sc_defaultContainerFrameForReferenceSize:hostBounds:` |
-| `0x43f1c` | `-sc_rememberedFrameForTargetIdentifier:hostLandscape:contentLandscape:referenceSize:fallback:` |
-| `0x463ac` | `-sc_dockSession:fromCorner:` |
-| `0x3a384` | `-sc_targetFramesForSide:` |
-| `0x3b1fc` | `-sc_layoutSide:animated:completion:` |
-| `0x3ac70` | `-sc_applyFrame:toRecord:` |
-| `0x3ab14` | `-sc_dockTransformForRecord:targetFrame:` |
-| `0x3e5e4` | `-sc_moveDraggingRecord:toSide:center:` |
-| `0x3f200` | `-sc_dockedFloatingItemView:didMoveToCenter:state:velocity:` |
+| `0x463ac` | `-sc_dockSession:fromCorner:`（内部 `setDisplayState:1`） |
+| `0x3c8d0` | 还原普通帧：`setDisplayState:3` |
+| `0x38b3c` | `displayState` / `0x38b4c` `setDisplayState:` |
+| `0x3c7e0` | `-sc_restoreRecordToNormalFrame:animated:completion:` |
