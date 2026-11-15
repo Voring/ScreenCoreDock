@@ -20,7 +20,7 @@
 //  v0.1.8：横屏修复（放开 sc_dockSession:fromCorner: 的方向守卫）
 //  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
 //  v0.2.0：横屏卡片过大，按 0.5 缩放并重排
-//  v0.2.1：横屏可点四角进侧贴；横屏四向边距统一 8pt
+//  v0.2.1：横屏可点四角进侧贴；横屏左右间距对齐，顶部再加一个状态栏高度
 //
 //    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
 //
@@ -83,6 +83,11 @@
 - (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
 @end
 
+// sceneManager 的委托方法，横屏点角时要手动转发给它
+@interface NSObject (SCDockFromCornerForwarding)
+- (void)sc_floatingContainerView:(id)view didRequestDockFromCorner:(NSInteger)corner;
+@end
+
 @interface SCFloatingDockManager : NSObject
 - (NSInteger)hostOrientation;
 - (UIView *)hostRootView;
@@ -98,6 +103,7 @@ static NSInteger (*orig_activeHostOrientation)(id, SEL);
 static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
 static void (*orig_restoreAllDocked)(id, SEL, BOOL);
 static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
+static void (*orig_handleDockTap)(id, SEL, id);
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
@@ -215,6 +221,21 @@ static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
 
 #pragma mark - 横屏缩小卡片
 
+// 横屏顶部要多留的量：优先读插件自己的 splitPortraitTopSpacing，
+// 其次取系统状态栏高度，都没有就按 44 兜底。
+static CGFloat sc_statusBarHeight(void) {
+    NSNumber *n = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
+        CFSTR("splitPortraitTopSpacing"), SC_DOMAIN);
+    CGFloat h = 0;
+    if ([n isKindOfClass:[NSNumber class]]) h = [n doubleValue];
+    if (h <= 0) {
+        CGRect sb = [UIApplication sharedApplication].statusBarFrame;
+        h = MIN(CGRectGetWidth(sb), CGRectGetHeight(sb));
+    }
+    if (h <= 0 || h > 200) h = 44.0;
+    return h;
+}
+
 // 横屏下卡片尺寸：默认各边各缩一半（面积 1/4），可用偏好 LandscapeDockScale 调
 static CGFloat sc_landscapeScale(void) {
     CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("LandscapeDockScale"),
@@ -261,11 +282,13 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
     if (keys.count == 0) return frames;
     CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
-    // 插件左右边距都是 8pt（0x3aaec / 0x3aaf8），横屏下顶部 inset 被算成 0，
-    // 这里统一成上下左右都用同一个 8pt 边距，不改插件逻辑。
-    CGFloat margin = 8.0;
+    // 插件左右边距本身是 8pt（0x3aaec / 0x3aaf8）。
+    // 横屏下保持右侧那个视觉间距（8 + 缩掉的一半宽度），左侧照抄同一值；
+    // 顶部在这个间距上再加一个状态栏高度，避免贴边太突兀。
+    CGFloat margin = 8.0 + first.size.width * (1.0 - scale);
+    CGFloat topGap = margin + sc_statusBarHeight();
     BOOL isRight = (CGRectGetMidX(first) > CGRectGetMidX(bounds));
-    CGFloat y = CGRectGetMinY(bounds) + margin;
+    CGFloat y = CGRectGetMinY(bounds) + topGap;
     CGFloat gap = 18.0 * scale;
 
     NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:keys.count];
@@ -291,8 +314,6 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 // 插件 -sc_handleDockTap:（0x386b0）在 0x38738 处比较容器 bounds：
 // 宽 > 高（横屏）就直接 return，四角落点按不发请求。
 // 竖屏仍走原方法；横屏复刻原方法末尾那一步，交给 sceneManager 去 dock。
-static void (*orig_handleDockTap)(id, SEL, id);
-
 static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
     UIView *superview = nil;
     @try { superview = [self superview]; }
@@ -334,7 +355,7 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
 
     SC_LOG(@"landscape dock tap corner=%ld, forward to sceneManager", (long)corner);
     @try {
-        [(id)delegate sc_floatingContainerView:self didRequestDockFromCorner:corner];
+        [(NSObject *)delegate sc_floatingContainerView:self didRequestDockFromCorner:corner];
     } @catch (NSException *e) {
         SC_LOG(@"landscape dock tap threw %@", e.reason);
     }
