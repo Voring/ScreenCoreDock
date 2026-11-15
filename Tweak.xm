@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.2
+//  ScreenCoreDock  v0.3.3
 //
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
 //  (system-tool:fullscreen-to-screencore-split)
@@ -15,21 +15,19 @@
 //    v0.1.9  转横屏时 -sc_restoreAllDockedSessionsAnimated:（0x42ca8 尾部 0x42ee0）
 //            不再把所有已侧贴的 session 强制收回；
 //    v0.2.0  横屏卡片过大 -> 按 0.5 缩放 + 自上而下紧凑重排（LandscapeDockScale）；
-//    v0.2.1  横屏左右间距对齐；
+//    v0.2.1  横屏左右间距对齐（左侧照抄右侧那个视觉间距）；
 //    v0.2.3  横屏顶部间距缩到 1/4。
 //
-//  v0.3.0 移除：浮窗四角的一切监听器（sc_handleDockTap: hook、自建 tap、region 布局 hook）
-//    与所有横屏点角转侧贴链。
+//  v0.3.0 移除（按需求推翻，永不再装）：
+//    - 浮窗四角的一切监听器：原 sc_handleDockTap: hook、自建 UITapGestureRecognizer、
+//      sc_layoutExternalInteractionRegions 诊断 hook；
+//    - 所有「横屏点角转侧贴」的兜底链路（delegate 转发 / session 兜底 / activeSession 兜底）。
+//    横屏下已存在的侧贴保持不动，位置也按上面的间距规则；但点四角不再有任何行为。
 //
-//  v0.3.1 左侧手势区（accessibilityIdentifier = "ScreenCore.Split.LeftMoveFullscreen"）
-//    原本绑 sc_handleFullscreenTap:（转全屏），改为 sc_handleCloseTap:（关闭浮窗），顶部不变。
-//
-//  v0.3.2 通知中心下拉会把已侧贴的应用全部收回。它与横屏强制收回不是同一条代码路径
-//    （横屏那条唯一调用点就是 sc_activeHostOrientationDidChange:duration: 尾部，
-//      全文件只有一处 bl sc_restoreAllDockedSessionsAnimated:）。
-//    通知中心就是 SpringBoard 的 CoverSheet（工具就是直接调
-//      -[SBCoverSheetPresentationManager setCoverSheetPresented:animated:withCompletion:]）。
-//    所以本版在收回入口上判断 CoverSheet 是否已展示：是则跳过收回/关闭。
+//  v0.3.1 新需求：浮窗左侧手势区（区域的 accessibilityIdentifier 是
+//    "ScreenCore.Split.LeftMoveFullscreen"）原本绑的是 sc_handleFullscreenTap:
+//    （转全屏），改成与右侧/下侧一致 -> sc_handleCloseTap:（关闭浮窗）。
+//    顶部 "ScreenCore.Split.TopMoveFullscreen" 不动，仍为全屏。
 //
 
 #import <Foundation/Foundation.h>
@@ -84,15 +82,16 @@ static void SCLogAppend(NSString *msg) {
 - (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (BOOL)sc_dockSessionForSingleActiveWindow:(id)session;
 - (void)sc_closeSession:(id)session animated:(BOOL)animated;   // 0x4b044
+- (void)sc_closeAllSessions;                                // 0x4addc
 @end
 
 @interface SCFloatingSceneManager (Orientation)
 - (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
 @end
 
-// 左侧手势区改关闭：两个 tapAction 在 0x34628 安装区域时绑定
-//   Top / Left    -> 0xab090 -> sc_handleFullscreenTap:（0x385b8）
-//   Bottom / Right -> 0xab098 -> sc_handleCloseTap:（0x3853c）
+// 左侧手势区改关闭：这两个 action 在 0x34628 安装区域时绑定
+//   Top/Left   -> 0xab090 -> sc_handleFullscreenTap:（0x385b8）
+//   Bottom/Right -> 0xab098 -> sc_handleCloseTap:（0x3853c）
 @interface SCFloatingContainerView : NSObject
 - (void)sc_handleFullscreenTap:(id)gesture;
 - (void)sc_handleCloseTap:(id)gesture;
@@ -106,6 +105,7 @@ static void SCLogAppend(NSString *msg) {
 - (BOOL)sc_dockSession:(id)session fromCorner:(NSInteger)corner;
 - (void)sc_restoreAllDockedSessionsAnimated:(BOOL)animated;
 - (void)sc_undockSession:(id)session animated:(BOOL)animated;   // 0x3ce94
+- (void)sc_restoreRecordToNormalFrame:(id)record animated:(BOOL)animated completion:(void (^)(void))completion; // 0x3c7e0
 @end
 
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
@@ -117,6 +117,8 @@ static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
 static void (*orig_handleFullscreenTap)(id, SEL, id);
 static void (*orig_undockSession)(id, SEL, id, BOOL);
 static void (*orig_closeSession)(id, SEL, id, BOOL);
+static void (*orig_closeAllSessions)(id, SEL);
+static void (*orig_restoreRecord)(id, SEL, id, BOOL, void (^)(void));
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
@@ -146,6 +148,7 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
         orientation = [(SCFloatingSceneManager *)self activeHostOrientation];
     } @catch (__unused NSException *e) {}
 
+    // 竖屏被拒是别的原因（session 不 live / 已 dock / 槽位满），不插手
     if (orientation < 3) {
         SC_LOG(@"dock rejected in portrait-%ld, leave as is", (long)orientation);
         return NO;
@@ -163,6 +166,7 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
         return YES;
     }
 
+    // 兜底：直接走 DockManager 层（该层无方向守卫）
     id dock = nil;
     @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
     @catch (__unused NSException *e) {}
@@ -197,26 +201,60 @@ static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
     if (orig_handleFullscreenTap) orig_handleFullscreenTap(self, _cmd, gesture);
 }
 
-#pragma mark - 通知中心下拉时保留侧贴（v0.3.2）
+#pragma mark - 通知中心下拉时保留侧贴（v0.3.3）
 
-// 通知中心 = SpringBoard 的 CoverSheet
-static BOOL sc_coverSheetPresented(void) {
+// 通知中心 = SpringBoard 的 CoverSheet。v0.3.2 只读了 isCoverSheetPresented，
+// 实测日志里 coverSheet 恒为 0：可能是类名/sharedInstance/getter 名与预期不符。
+// 本版：缓存 manager、依次尝试多个 getter、启动时把探测结果写进日志。
+
+static id sc_coverSheetManager(void) {
     static Class csCls = Nil;
-    if (!csCls) csCls = objc_getClass("SBCoverSheetPresentationManager");
-    if (!csCls) return NO;
-
-    id mgr = nil;
-    @try {
-        SEL shared = NSSelectorFromString(@"sharedInstance");
-        if ([csCls respondsToSelector:shared]) {
-            mgr = ((id (*)(id, SEL))objc_msgSend)((id)csCls, shared);
+    static id cachedMgr = nil;
+    static BOOL looked = NO;
+    if (!looked) {
+        looked = YES;
+        csCls = objc_getClass("SBCoverSheetPresentationManager");
+        if (csCls) {
+            @try {
+                SEL shared = NSSelectorFromString(@"sharedInstance");
+                if ([csCls respondsToSelector:shared]) {
+                    cachedMgr = ((id (*)(id, SEL))objc_msgSend)((id)csCls, shared);
+                }
+            } @catch (__unused NSException *e) {}
         }
-    } @catch (__unused NSException *e) {}
+    }
+    return cachedMgr;
+}
 
+static NSArray *sc_coverSheetGetters(void) {
+    return @[ @"isCoverSheetPresented", @"coverSheetPresented", @"isPresented", @"presented" ];
+}
+
+static BOOL sc_coverSheetPresented(void) {
+    id mgr = sc_coverSheetManager();
     if (!mgr) return NO;
-    SEL presented = NSSelectorFromString(@"isCoverSheetPresented");
-    if (![mgr respondsToSelector:presented]) return NO;
-    return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, presented);
+    for (NSString *name in sc_coverSheetGetters()) {
+        SEL s = NSSelectorFromString(name);
+        if ([mgr respondsToSelector:s]) {
+            return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s);
+        }
+    }
+    return NO;
+}
+
+static void sc_dumpCoverSheetDiagnostics(void) {
+    Class cs = objc_getClass("SBCoverSheetPresentationManager");
+    SC_LOG(@"coverSheet class=%@", cs ? NSStringFromClass(cs) : @"nil");
+    id mgr = sc_coverSheetManager();
+    SC_LOG(@"coverSheet manager=%@", mgr ? NSStringFromClass(mgr) : @"nil");
+    if (!mgr) return;
+    for (NSString *name in sc_coverSheetGetters()) {
+        SEL s = NSSelectorFromString(name);
+        BOOL resp = [mgr respondsToSelector:s];
+        int val = -1;
+        if (resp) val = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s);
+        SC_LOG(@"coverSheet getter %@ responds=%d value=%d", name, (int)resp, val);
+    }
 }
 
 static void hook_undockSession(id self, SEL _cmd, id session, BOOL animated) {
@@ -228,9 +266,29 @@ static void hook_undockSession(id self, SEL _cmd, id session, BOOL animated) {
 }
 
 static void hook_closeSessionAnimated(id self, SEL _cmd, id session, BOOL animated) {
+    BOOL shown = sc_coverSheetPresented();
     SC_LOG(@"sc_closeSession:animated: called (coverSheet=%d) session=%@",
-           (int)sc_coverSheetPresented(), [session class]);
+           (int)shown, [session class]);
+    if (shown) {
+        SC_LOG(@"notification center shown: skip closeSession:%@", [session class]);
+        return;
+    }
     orig_closeSession(self, _cmd, session, animated);
+}
+
+static void hook_closeAllSessions(id self, SEL _cmd) {
+    if (sc_coverSheetPresented()) {
+        SC_LOG(@"notification center shown: skip closeAllSessions");
+        return;
+    }
+    orig_closeAllSessions(self, _cmd);
+}
+
+static void hook_restoreRecord(id self, SEL _cmd, id record, BOOL animated,
+                                void (^completion)(void)) {
+    SC_LOG(@"restoreRecordToNormalFrame called (coverSheet=%d) record=%@",
+           (int)sc_coverSheetPresented(), [record class]);
+    orig_restoreRecord(self, _cmd, record, animated, completion);
 }
 
 #pragma mark - 横屏不强制收回侧贴（v0.1.9）+ 横屏重排
@@ -244,6 +302,7 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
     }
     SC_LOG(@"orientation change -> %ld done", (long)orientation);
 
+    // 转进横屏后补一次侧边布局，让 hook_targetFramesForSide 的缩放帧真正落地
     if (orientation >= 3) {
         id dock = nil;
         @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
@@ -344,6 +403,8 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
     if (keys.count == 0) return frames;
     CGRect first = [(NSValue *)frames[keys.firstObject] CGRectValue];
+    // 横屏左右间距：保持右侧那个视觉间距（8 + 缩掉的一半宽度），左侧照抄同一值。
+    // 顶部只取该间距叠加状态栏高度的 1/4。
     CGFloat margin = 8.0 + first.size.width * (1.0 - scale);
     CGFloat topGap = (margin + sc_statusBarHeight()) * 0.25;
     BOOL isRight = (CGRectGetMidX(first) > CGRectGetMidX(bounds));
@@ -458,14 +519,6 @@ static void installHook(int attempt) {
         SC_LOG(@"sc_handleFullscreenTap: hook skipped");
     }
 
-    if ([cls instancesRespondToSelector:@selector(sc_closeSession:animated:)]) {
-        MSHookMessageEx(cls,
-                        @selector(sc_closeSession:animated:),
-                        (IMP)hook_closeSessionAnimated,
-                        (IMP *)&orig_closeSession);
-        SC_LOG(@"hooked sc_closeSession:animated: (log only)");
-    }
-
     Class dockCls = objc_getClass("SCFloatingDockManager");
     if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_targetFramesForSide:)]) {
         MSHookMessageEx(dockCls,
@@ -480,6 +533,27 @@ static void installHook(int attempt) {
                         (IMP *)&orig_undockSession);
         SC_LOG(@"hooked sc_undockSession:animated: (skip while cover sheet shown)");
     }
+    if ([cls instancesRespondToSelector:@selector(sc_closeSession:animated:)]) {
+        MSHookMessageEx(cls,
+                        @selector(sc_closeSession:animated:),
+                        (IMP)hook_closeSessionAnimated,
+                        (IMP *)&orig_closeSession);
+        SC_LOG(@"hooked sc_closeSession:animated: (skip while cover sheet shown)");
+    }
+    if ([cls instancesRespondToSelector:@selector(sc_closeAllSessions)]) {
+        MSHookMessageEx(cls,
+                        @selector(sc_closeAllSessions),
+                        (IMP)hook_closeAllSessions,
+                        (IMP *)&orig_closeAllSessions);
+        SC_LOG(@"hooked sc_closeAllSessions");
+    }
+    if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_restoreRecordToNormalFrame:animated:completion:)]) {
+        MSHookMessageEx(dockCls,
+                        @selector(sc_restoreRecordToNormalFrame:animated:completion:),
+                        (IMP)hook_restoreRecord,
+                        (IMP *)&orig_restoreRecord);
+        SC_LOG(@"hooked sc_restoreRecordToNormalFrame:animated:completion:");
+    }
     if (dockCls && [dockCls instancesRespondToSelector:@selector(sc_restoreAllDockedSessionsAnimated:)]) {
         MSHookMessageEx(dockCls,
                         @selector(sc_restoreAllDockedSessionsAnimated:),
@@ -487,12 +561,13 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet)");
+    sc_dumpCoverSheetDiagnostics();
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet v3)");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.2 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.3 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
