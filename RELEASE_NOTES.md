@@ -1,65 +1,68 @@
-# ScreenCoreDock v0.3.2
+# ScreenCoreDock v0.3.3
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.2`
+- 版本：`0.3.3`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## 改动说明
+## v0.3.2 日志结论
 
-下拉通知中心不再收回已侧贴的应用。控制中心不受影响（原本就不受影响）。
+v0.3.2 真机日志（`/var/mobile/Library/Logs/ScreenCoreDock.log`）：
 
-### 与横屏收回是否共通
+- 三次 `v0.3.2 loaded`，hook 全部挂上；
+- 只有 `sc_closeSession:animated: called (coverSheet=0)`，没有任何 `undockSession` / `restoreAllDocked` / `restoreRecordToNormalFrame` 记录；
+- `coverSheet` 恒为 0。说明两个问题：
+  1. 我们当初写的 `isCoverSheetPresented` getter 很可能在这个类上不存在（或 `sharedInstance` 取不到），状态探测一直返回 NO；
+  2. 通知中心收回侧贴到底走哪条入口，现有日志还不能定论，需要把拦截点再铺开。
 
-不共通。全文件只有一处调用 `sc_restoreAllDockedSessionsAnimated:`：
+## 本版改动
 
-```
-0x42ee0  bl  sc_restoreAllDockedSessionsAnimated:   ; 只在 sc_activeHostOrientationDidChange:duration: 尾部
-```
+### 1. CoverSheet 状态探测补全
 
-而通知中心走的是另一条：ScreenCore 的通知工具直接向 SpringBoard 要 CoverSheet：
-
-```
-0x104d8  CFSTR "SBCoverSheetPresentationManager"
-0x104f8  sharedInstance
-0x1052c  setCoverSheetPresented:animated:withCompletion:
-```
-
-所以不能省代码，得单独处理。
-
-### 本版改法
-
-1. 读 CoverSheet 状态：
-
-```objc
-Class cs = objc_getClass("SBCoverSheetPresentationManager");
-id mgr = [cs sharedInstance];
-BOOL shown = [mgr isCoverSheetPresented];
-```
-
-2. 在收回入口上判断：
-   - `SCFloatingDockManager -sc_undockSession:animated:`（0x3ce94）：CoverSheet 展示时直接返回，不收；
-   - `SCFloatingDockManager -sc_restoreAllDockedSessionsAnimated:`（0x3d13c）：同样跳过；
-   - `SCFloatingSceneManager -sc_closeSession:animated:`（0x4b044）：本版只记录，不改行为。
-
-### 日志
+缓存 `SBCoverSheetPresentationManager` 实例，依次尝试四个 getter：
 
 ```
-v0.3.2 loaded in SpringBoard
-hooked sc_undockSession:animated: (skip while cover sheet shown)
-v0.3.2 ... keepOnCoverSheet
-notification center shown: skip undockSession:SCFloatingSceneSession
-notification center shown: skip restoreAllDockedSessionsAnimated:
-sc_closeSession:animated: called (coverSheet=1) session=SCFloatingSceneSession
+isCoverSheetPresented / coverSheetPresented / isPresented / presented
 ```
 
-如果下拉通知中心后卡片仍然没了，看日志里到底出现哪一行：
+启动时把探测结果写进日志，方便确认类、实例、getter 是否存在：
 
-- 只有 `skip undock...` 却还是消失 -> 走的是 `sc_closeSession:animated:`，下一版直接拦它；
-- 完全没有这类日志 -> 走的不是这两个入口，需要再从 `sc_prepareForExternalForegroundLaunchOfBundleIdentifier:` / `willDismissSession:` 查。
+```
+coverSheet class=SBCoverSheetPresentationManager
+coverSheet manager=SBCoverSheetPresentationManager
+coverSheet getter isCoverSheetPresented responds=0 value=-1
+coverSheet getter coverSheetPresented responds=0 value=-1
+coverSheet getter isPresented responds=1 value=0
+coverSheet getter presented responds=1 value=0
+```
+
+### 2. 扩充回收拦截点
+
+| 方法 | 类 | 行为 |
+|---|---|---|
+| `sc_undockSession:animated:` | DockManager | CoverSheet 展示时跳过 |
+| `sc_restoreAllDockedSessionsAnimated:` | DockManager | CoverSheet 展示时跳过 |
+| `sc_closeSession:animated:` | SceneManager | CoverSheet 展示时跳过（v0.3.2 只记日志，本版拦截） |
+| `sc_closeAllSessions` | SceneManager | CoverSheet 展示时跳过 |
+| `sc_restoreRecordToNormalFrame:animated:completion:` | DockManager | 只记日志，不改行为 |
+
+### 3. 下次需要回传的日志
+
+安装后：
+
+1. 重启 SpringBoard，看启动段 `coverSheet class/manager/getter` 四行；
+2. 贴好侧贴，下拉一次通知中心，再收起；
+3. 把整份 `ScreenCoreDock.log` 回传。
+
+判断依据：
+
+- `coverSheet manager=nil` -> 类名或 `sharedInstance` 不对，需要换状态来源；
+- 四个 getter `responds=0` -> 这个类的属性名要再反查；
+- 下拉后出现 `skip closeSession` / `skip closeAllSessions` -> 拦截生效；
+- 四个入口都没出现新日志，但卡片还是消失 -> 走的是场景层隐藏（不在这五个方法里），再查 `sc_floatingDockManager:willDismissSession:` 或场景投递路径。
 
 ## 保留的既有改动
 
