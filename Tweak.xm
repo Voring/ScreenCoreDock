@@ -1,29 +1,28 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.2.6
-//
-//  逻辑回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
-//  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
+//  ScreenCoreDock  v0.3.0
 //
 //  目标：把 ScreenCore 2.0.5 的系统工具「全屏转ScreenCore分屏」
 //  (system-tool:fullscreen-to-screencore-split)
 //  由「前台应用 -> 分屏浮窗（居中大窗口）」改为「前台应用 -> 侧贴浮窗（贴屏幕两侧的小卡片）」。
 //
-//  v0.1.0 基线：hook -sc_openFrontmostApplicationAsSplitFromSourceRect:（0x48eb8）
+//  基线（v0.1.0）：hook -[SCFloatingSceneManager sc_openFrontmostApplicationAsSplitFromSourceRect:]（0x48eb8）
 //    原方法返回后取 activeSession 调 -sc_dockSession:fromCorner:；
 //    失败再走 -sc_dockSessionForSingleActiveWindow:。
 //
-//  v0.1.8：放开 -sc_dockSession:fromCorner:（0x463ac）的方向守卫（0x463e4 只接受 1/2）。
-//  v0.1.9：解掉转横屏时 -sc_restoreAllDockedSessionsAnimated:（0x42ca8 尾部 0x42ee0）把侧贴全收回。
-//  v0.2.0：横屏卡片过大，按 0.5 缩放并紧凑重排。
-//  v0.2.1：横屏左右间距对齐。
-//  v0.2.2：修安全模式（不再在初始化时遍历全类表，改按类名取类）。
-//  v0.2.3：顶部间距缩到 1/4；横屏点角补 session 兜底。
-//  v0.2.4：点角取 session 失败时再退 activeSession。
-//  v0.2.5：日志落盘（/var/mobile/Library/Logs/ScreenCoreDock.log）。
-//  v0.2.6：真机日志证明横屏点角根本没进 sc_handleDockTap:（手势层问题），
-//          改为在容器上自建一个 tap 手势，点四角直接走 dock，不再依赖原手势；
-//          同时记录四角 region 的实际 frame 以便核对。
+//  保留的横屏能力：
+//    v0.1.8  放开 -sc_dockSession:fromCorner:（0x463ac）的方向守卫（0x463e4 只接受 1/2）；
+//    v0.1.9  转横屏时 -sc_restoreAllDockedSessionsAnimated:（0x42ca8 尾部 0x42ee0）
+//            不再把所有已侧贴的 session 强制收回；
+//    v0.2.0  横屏卡片过大 -> 按 0.5 缩放 + 自上而下紧凑重排（LandscapeDockScale）；
+//    v0.2.1  横屏左右间距对齐（左侧照抄右侧那个视觉间距）；
+//    v0.2.3  横屏顶部间距缩到 1/4。
+//
+//  v0.3.0 移除（按需求推翻，永不再装）：
+//    - 浮窗四角的一切监听器：原 sc_handleDockTap: hook、自建 UITapGestureRecognizer、
+//      sc_layoutExternalInteractionRegions 诊断 hook；
+//    - 所有「横屏点角转侧贴」的兜底链路（delegate 转发 / session 兜底 / activeSession 兜底）。
+//    横屏下已存在的侧贴保持不动，位置也按上面的间距规则；但点四角不再有任何行为。
 //
 
 #import <Foundation/Foundation.h>
@@ -33,6 +32,7 @@
 
 #define SC_DOMAIN CFSTR("com.susudear.screencore")
 
+// 日志同时写文件：/var/mobile/Library/Logs/ScreenCoreDock.log（不可写则 /tmp/ScreenCoreDock.log）
 static void SCLogAppend(NSString *msg) {
     static NSString *path = nil;
     static dispatch_once_t onceToken;
@@ -82,12 +82,6 @@ static void SCLogAppend(NSString *msg) {
 - (void)sc_activeHostOrientationDidChange:(NSInteger)orientation duration:(double)duration;
 @end
 
-// sceneManager 的委托方法，横屏点角时要手动转发给它
-@interface NSObject (SCDockFromCornerForwarding)
-- (void)sc_floatingContainerView:(id)view didRequestDockFromCorner:(NSInteger)corner;
-- (id)sc_sessionForContainerView:(id)view;
-@end
-
 @interface SCFloatingDockManager : NSObject
 - (NSInteger)hostOrientation;
 - (UIView *)hostRootView;
@@ -97,26 +91,12 @@ static void SCLogAppend(NSString *msg) {
 - (void)sc_restoreAllDockedSessionsAnimated:(BOOL)animated;
 @end
 
-@interface SCFloatingContainerView : NSObject
-- (void)sc_handleDockTap:(id)gesture;
-- (void)sc_layoutExternalInteractionRegions;
-- (NSArray *)cornerResizeTouchRegions;
-- (id)delegate;
-@end
-
-// 自建 tap 手势的 target
-@interface SCDockTapProxy : NSObject
-- (void)sc_cornerTap:(UITapGestureRecognizer *)gesture;
-@end
-
 static BOOL (*orig_openFrontmostAsSplit)(id, SEL, CGRect);
 static BOOL (*orig_dockSession)(id, SEL, id, NSInteger);
 static NSInteger (*orig_activeHostOrientation)(id, SEL);
 static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
 static void (*orig_restoreAllDocked)(id, SEL, BOOL);
 static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
-static void (*orig_handleDockTap)(id, SEL, id);
-static void (*orig_layoutRegions)(id, SEL);
 
 // 只在横屏重入 dock 期间为 YES
 static BOOL sc_forcePortrait = NO;
@@ -130,70 +110,7 @@ static NSInteger sc_defaultDockCorner(void) {
     return ([side integerValue] == 1) ? 2 : 1;
 }
 
-static BOOL sc_containerIsDocked(id container) {
-    BOOL docked = NO;
-    @try {
-        if ([container respondsToSelector:@selector(isDocked)]) {
-            docked = ((BOOL (*)(id, SEL))objc_msgSend)(container, @selector(isDocked));
-        }
-    } @catch (__unused NSException *e) {}
-    return docked;
-}
-
-// 把「某个容器 + 角编号」落成侧贴。转发无效时按 session 直接 dock。
-static BOOL sc_dockContainerFromCorner(id container, NSInteger corner, NSString *tag) {
-    if (corner <= 0) return NO;
-    if (sc_containerIsDocked(container)) {
-        SC_LOG(@"%@: already docked, ignore", tag);
-        return YES;
-    }
-
-    id delegate = nil;
-    @try {
-        if ([container respondsToSelector:@selector(delegate)]) delegate = [container delegate];
-    } @catch (__unused NSException *e) {}
-    SC_LOG(@"%@ corner=%ld delegate=%@", tag, (long)corner, [delegate class]);
-
-    if ([delegate respondsToSelector:@selector(sc_floatingContainerView:didRequestDockFromCorner:)]) {
-        @try {
-            [(NSObject *)delegate sc_floatingContainerView:container didRequestDockFromCorner:corner];
-        } @catch (NSException *e) {
-            SC_LOG(@"%@ forward threw %@", tag, e.reason);
-        }
-    }
-    if (sc_containerIsDocked(container)) {
-        SC_LOG(@"%@ ok via forward", tag);
-        return YES;
-    }
-
-    id session = nil;
-    @try {
-        if ([delegate respondsToSelector:@selector(sc_sessionForContainerView:)]) {
-            session = [(NSObject *)delegate sc_sessionForContainerView:container];
-        }
-    } @catch (NSException *e) {
-        SC_LOG(@"%@ session lookup threw %@", tag, e.reason);
-    }
-    if (!session && [delegate respondsToSelector:@selector(activeSession)]) {
-        @try { session = [(SCFloatingSceneManager *)delegate activeSession]; }
-        @catch (__unused NSException *e) {}
-        SC_LOG(@"%@: no session for container, fall back to activeSession=%@", tag, [session class]);
-    }
-    if (!session) {
-        SC_LOG(@"%@: no session at all", tag);
-        return NO;
-    }
-    BOOL ok = NO;
-    @try {
-        ok = [(SCFloatingSceneManager *)delegate sc_dockSession:session fromCorner:corner];
-    } @catch (NSException *e) {
-        SC_LOG(@"%@ dock threw %@", tag, e.reason);
-    }
-    SC_LOG(@"%@ direct dock corner=%ld ok=%d", tag, (long)corner, ok);
-    return ok;
-}
-
-#pragma mark - 横屏修复
+#pragma mark - 横屏放开 dock 入口（v0.1.8）
 
 static NSInteger hook_activeHostOrientation(id self, SEL _cmd) {
     if (sc_forcePortrait) return 1;
@@ -209,6 +126,7 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
         orientation = [(SCFloatingSceneManager *)self activeHostOrientation];
     } @catch (__unused NSException *e) {}
 
+    // 竖屏被拒是别的原因（session 不 live / 已 dock / 槽位满），不插手
     if (orientation < 3) {
         SC_LOG(@"dock rejected in portrait-%ld, leave as is", (long)orientation);
         return NO;
@@ -240,86 +158,7 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
     return ok;
 }
 
-#pragma mark - 自建四角 tap 手势
-
-@implementation SCDockTapProxy
-
-- (void)sc_cornerTap:(UITapGestureRecognizer *)gesture {
-    UIView *view = gesture.view;
-    if (!view) return;
-
-    CGPoint p = [gesture locationInView:view];
-    CGRect b = view.bounds;
-    CGFloat w = CGRectGetWidth(b), h = CGRectGetHeight(b);
-    if (w <= 0 || h <= 0) return;
-
-    CGFloat zone = MIN(MIN(w, h), 48.0);
-    BOOL left = (p.x <= zone), right = (p.x >= w - zone);
-    BOOL top = (p.y <= zone), bottom = (p.y >= h - zone);
-
-    NSInteger corner = 0;
-    if (top && left) corner = 1;
-    else if (top && right) corner = 2;
-    else if (bottom && left) corner = 3;
-    else if (bottom && right) corner = 4;
-
-    SC_LOG(@"own corner tap at %.0f,%.0f in %.0fx%.0f -> corner=%ld",
-           p.x, p.y, w, h, (long)corner);
-    if (corner == 0) return;
-
-    sc_dockContainerFromCorner(view, corner, @"own corner dock");
-}
-
-@end
-
-// 给容器装一个自己的 tap：原插件那套四角 region 在横屏下没被触发
-// （真机日志里 sc_handleDockTap: 完全没进来），这里不再依赖它。
-static void sc_installCornerTap(UIView *view) {
-    if (!view) return;
-    static SCDockTapProxy *proxy = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ proxy = [SCDockTapProxy new]; });
-
-    if (objc_getAssociatedObject(view, "SCDockCornerTap")) return;
-    objc_setAssociatedObject(view, "SCDockCornerTap", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:proxy
-                                                                        action:@selector(sc_cornerTap:)];
-    tap.numberOfTapsRequired = 1;
-    tap.cancelsTouchesInView = NO;
-    tap.delaysTouchesEnded = NO;
-    [view addGestureRecognizer:tap];
-    SC_LOG(@"installed own corner tap on %@ bounds=%@", [view class], NSStringFromCGRect(view.bounds));
-}
-
-static void sc_walkForContainers(UIView *view, Class cls) {
-    if (!view || !cls) return;
-    if ([view isKindOfClass:cls]) {
-        sc_installCornerTap(view);
-    }
-    for (UIView *sub in view.subviews) {
-        sc_walkForContainers(sub, cls);
-    }
-}
-
-static void sc_installCornerTapsEverywhere(SCFloatingSceneManager *manager) {
-    id dock = nil;
-    @try { dock = [(SCFloatingSceneManager *)manager dockManager]; }
-    @catch (__unused NSException *e) {}
-    UIView *root = nil;
-    @try {
-        if ([dock respondsToSelector:@selector(hostRootView)]) {
-            root = [(SCFloatingDockManager *)dock hostRootView];
-        }
-    } @catch (__unused NSException *e) {}
-    if (!root) {
-        SC_LOG(@"own corner tap: hostRootView nil, skip");
-        return;
-    }
-    sc_walkForContainers(root, objc_getClass("SCFloatingContainerView"));
-}
-
-#pragma mark - 横屏保留侧贴
+#pragma mark - 横屏不强制收回侧贴（v0.1.9）+ 横屏重排
 
 static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, double duration) {
     sc_inOrientationChange = YES;
@@ -334,25 +173,21 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
         id dock = nil;
         @try { dock = [(SCFloatingSceneManager *)self dockManager]; }
         @catch (__unused NSException *e) {}
-        SCFloatingSceneManager *mgr = (SCFloatingSceneManager *)self;
-        for (NSNumber *delay in @[@0.1, @0.4]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @autoreleasepool {
-                    for (NSInteger side = 1; side <= 2; side++) {
-                        @try {
-                            if ([dock respondsToSelector:@selector(sc_layoutSide:animated:completion:)]) {
-                                [(SCFloatingDockManager *)dock sc_layoutSide:side animated:NO completion:nil];
-                            }
-                        } @catch (NSException *e) {
-                            SC_LOG(@"landscape relayout side=%ld threw %@", (long)side, e.reason);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                for (NSInteger side = 1; side <= 2; side++) {
+                    @try {
+                        if ([dock respondsToSelector:@selector(sc_layoutSide:animated:completion:)]) {
+                            [(SCFloatingDockManager *)dock sc_layoutSide:side animated:NO completion:nil];
                         }
+                    } @catch (NSException *e) {
+                        SC_LOG(@"landscape relayout side=%ld threw %@", (long)side, e.reason);
                     }
-                    sc_installCornerTapsEverywhere(mgr);
-                    SC_LOG(@"landscape relayout done");
                 }
-            });
-        }
+                SC_LOG(@"landscape relayout done");
+            }
+        });
     }
 }
 
@@ -373,7 +208,7 @@ static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
     orig_restoreAllDocked(self, _cmd, animated);
 }
 
-#pragma mark - 横屏缩小卡片
+#pragma mark - 横屏卡片缩放与间距（v0.2.0 / v0.2.1 / v0.2.3）
 
 static CGFloat sc_statusBarHeight(void) {
     NSNumber *n = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
@@ -454,52 +289,6 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
     return out;
 }
 
-#pragma mark - 原来的横屏点角 hook（保留作对照）
-
-static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
-    UIView *superview = nil;
-    @try { superview = [self superview]; }
-    @catch (__unused NSException *e) {}
-
-    if (!superview || CGRectGetWidth(superview.bounds) <= CGRectGetHeight(superview.bounds)) {
-        if (orig_handleDockTap) orig_handleDockTap(self, _cmd, gesture);
-        return;
-    }
-
-    SC_LOG(@"landscape dock tap enter, superview=%@", NSStringFromCGRect(superview.bounds));
-
-    NSInteger corner = 0;
-    @try {
-        UIView *tapView = (UIView *)((id (*)(id, SEL))objc_msgSend)(gesture, @selector(view));
-        if ([tapView respondsToSelector:@selector(tag)]) {
-            corner = ((NSInteger (*)(id, SEL))objc_msgSend)(tapView, @selector(tag));
-        }
-    } @catch (__unused NSException *e) {}
-
-    sc_dockContainerFromCorner(self, corner, @"landscape dock tap");
-}
-
-// 记录四角 region 的实际位置，用于核对横屏下是否被布局到容器外/不可点
-static void hook_layoutRegions(id self, SEL _cmd) {
-    orig_layoutRegions(self, _cmd);
-    @try {
-        NSArray *regions = [(SCFloatingContainerView *)self cornerResizeTouchRegions];
-        if (regions.count == 0) {
-            SC_LOG(@"regions layout: none");
-            return;
-        }
-        NSMutableString *buf = [NSMutableString string];
-        for (UIView *v in regions) {
-            if (![v isKindOfClass:[UIView class]]) continue;
-            [buf appendFormat:@"[tag=%ld %@ hit=%d] ", (long)v.tag,
-             NSStringFromCGRect(v.frame), (int)v.isUserInteractionEnabled];
-        }
-        SC_LOG(@"regions layout: container=%@ %@", NSStringFromCGRect(((UIView *)self).bounds), buf);
-    } @catch (NSException *e) {
-        SC_LOG(@"regions layout log threw %@", e.reason);
-    }
-}
-
 #pragma mark - 入口
 
 static void sc_dockSessionIfPossible(SCFloatingSceneManager *manager) {
@@ -535,11 +324,6 @@ static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
 
     @autoreleasepool {
         sc_dockSessionIfPossible((SCFloatingSceneManager *)self);
-        SCFloatingSceneManager *mgr = (SCFloatingSceneManager *)self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            sc_installCornerTapsEverywhere(mgr);
-        });
     }
     return result;
 }
@@ -596,32 +380,12 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    Class containerCls = objc_getClass("SCFloatingContainerView");
-    if (containerCls) {
-        if ([containerCls instancesRespondToSelector:@selector(sc_handleDockTap:)]) {
-            MSHookMessageEx(containerCls,
-                            @selector(sc_handleDockTap:),
-                            (IMP)hook_handleDockTap,
-                            (IMP *)&orig_handleDockTap);
-            SC_LOG(@"hooked sc_handleDockTap: on SCFloatingContainerView");
-        }
-        if ([containerCls instancesRespondToSelector:@selector(sc_layoutExternalInteractionRegions)]) {
-            MSHookMessageEx(containerCls,
-                            @selector(sc_layoutExternalInteractionRegions),
-                            (IMP)hook_layoutRegions,
-                            (IMP *)&orig_layoutRegions);
-            SC_LOG(@"hooked sc_layoutExternalInteractionRegions");
-        }
-    } else {
-        SC_LOG(@"SCFloatingContainerView not found, container hooks skipped");
-    }
-
-    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + dockTap + regions)");
+    SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames), corner listeners removed");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.2.6 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.0 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
