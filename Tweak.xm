@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.2.1
+//  ScreenCoreDock  v0.2.2
 //
 //  代码回退到 v0.1.0 初版：只有「打开分屏后补一次 dock」这一条逻辑，
 //  去掉 v0.1.1~v0.1.7 的自由摆放 / FreeFloatMode / 帧表覆盖 / 收尾层 hook。
@@ -21,6 +21,7 @@
 //  v0.1.9：再解掉「转入横屏时强制收回全部侧贴」这一道限制
 //  v0.2.0：横屏卡片过大，按 0.5 缩放并重排
 //  v0.2.1：横屏可点四角进侧贴；横屏左右间距对齐，顶部再加一个状态栏高度
+//  v0.2.2：修安全模式 —— 不再在初始化时遍历全类表，改为按类名取 SCFloatingContainerView
 //
 //    第二道限制在 -sc_activeHostOrientationDidChange:duration:（0x42ca8）末尾：
 //
@@ -311,7 +312,7 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
 
 #pragma mark - 横屏点角落进侧贴
 
-// 插件 -sc_handleDockTap:（0x386b0）在 0x38738 处比较容器 bounds：
+// 插件 -[SCFloatingContainerView sc_handleDockTap:]（0x386b0）在 0x38738 处比较容器 bounds：
 // 宽 > 高（横屏）就直接 return，四角落点按不发请求。
 // 竖屏仍走原方法；横屏复刻原方法末尾那一步，交给 sceneManager 去 dock。
 static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
@@ -320,7 +321,7 @@ static void hook_handleDockTap(id self, SEL _cmd, id gesture) {
     @catch (__unused NSException *e) {}
 
     if (!superview || CGRectGetWidth(superview.bounds) <= CGRectGetHeight(superview.bounds)) {
-        orig_handleDockTap(self, _cmd, gesture);
+        if (orig_handleDockTap) orig_handleDockTap(self, _cmd, gesture);
         return;
     }
 
@@ -456,23 +457,18 @@ static void installHook(int attempt) {
                         (IMP *)&orig_restoreAllDocked);
     }
 
-    // 横屏点四角：按选择器找到那个视图类再挂（类名未导出）
-    int classCount = (int)objc_getClassList(NULL, 0);
-    if (classCount > 0) {
-        Class *classes = (Class *)calloc((size_t)classCount, sizeof(Class));
-        classCount = (int)objc_getClassList(classes, classCount);
-        for (int i = 0; i < classCount; i++) {
-            Class c = classes[i];
-            if ([c instancesRespondToSelector:@selector(sc_handleDockTap:)] &&
-                [c instancesRespondToSelector:@selector(cornerResizeTouchRegions)]) {
-                MSHookMessageEx(c,
-                                @selector(sc_handleDockTap:),
-                                (IMP)hook_handleDockTap,
-                                (IMP *)&orig_handleDockTap);
-                SC_LOG(@"hooked sc_handleDockTap: on %@", c);
-            }
-        }
-        free(classes);
+    // 横屏点四角：直接按类名取（SCFloatingContainerView 同时实现
+    // sc_handleDockTap: / isDocked / delegate），不再遍历全类表，
+    // 避免初始化阶段 messaging 未 realize 的类导致安全模式。
+    Class containerCls = objc_getClass("SCFloatingContainerView");
+    if (containerCls && [containerCls instancesRespondToSelector:@selector(sc_handleDockTap:)]) {
+        MSHookMessageEx(containerCls,
+                        @selector(sc_handleDockTap:),
+                        (IMP)hook_handleDockTap,
+                        (IMP *)&orig_handleDockTap);
+        SC_LOG(@"hooked sc_handleDockTap: on SCFloatingContainerView");
+    } else {
+        SC_LOG(@"SCFloatingContainerView not found, dock tap hook skipped");
     }
 
     SC_LOG(@"hooked (open + dockSession + orientation + restoreAllDocked + targetFrames + dockTap)");
