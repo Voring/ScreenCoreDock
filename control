@@ -1,8 +1,8 @@
 Package: com.voring.screencoredock
 Name: ScreenCoreDock
-Version: 0.1.8
+Version: 0.1.9
 Architecture: iphoneos-arm64
-Description: 把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」；v0.1.8 回退到 v0.1.0 逻辑，并修复横屏应用无法转侧贴
+Description: 把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」；逻辑同 v0.1.0，v0.1.8/0.1.9 放开横屏侧贴限制
 Maintainer: Voring
 Author: Voring
 Section: Tweaks
