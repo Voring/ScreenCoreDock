@@ -23,7 +23,7 @@
 //       它完全忽略落点 Y，normalizedY 只是序号百分比。
 //       normalizedY 的用途只有排序（-sc_sortedRecordsForSide:）。
 //
-//  2) -sc_targetFramesForSide:（0x3a384）
+//  2) -sc_targetFramesForSide:���0x3a384）
 //       取 sortedRecordsForSide，逐条算尺寸后累加 Y：
 //         0x3aa84  y = y + (gap + height)        // gap = count>1 ? 18 : 0
 //       纵向没有任何"槽位"参数可调，就是自上而下堆叠。
@@ -37,26 +37,31 @@
 //
 //  模式 2 的实现：
 //    A. hook  -sc_moveDraggingRecord:toSide:center:
-//         记下落点中心（hostRootView 坐标系）+ 记下当时的 side，保持 side 不变，
+//         记下落点中心（hostRootView 坐标系）+ 钉住 side，
 //         避免 0x3e790 用 center.x 与帧 x 比较导致 side 反复翻转（闪烁来源）。
 //    B. hook  -sc_targetFramesForSide:
-//         对"有自由中心"的 record，把槽位**平移**到该中心，尺寸沿用槽位尺寸
-//         （尺寸必须沿用：-sc_applyFrame:toRecord: 内部会按 目标帧尺寸/normalFrame 尺寸
-//          算缩放，尺寸被改大就会把卡片放大数倍）。
+//         对"有自由中心"的 record，把槽位平移（尺寸沿用槽位尺寸）到该中心。
+//         尺寸必须沿用：-sc_applyFrame:toRecord: 内部按 目标帧尺寸/normalFrame 尺寸
+//         算缩放，尺寸被改大就会把卡片放大数倍。
 //    C. hook  -sc_dockedFloatingItemView:didMoveToCenter:state:velocity:
-//         命中自由记录时直接返回，不调 orig —— 让 A/B 决定位置。
+//         命中自由记录时直接返回，不调 orig。
 //
-//  已验证选择器：
-//    -sc_openFrontmostApplicationAsSplitFromSourceRect:      0x48eb8
-//    -activeSession          0x65260(stub)   -dockManager    0x66880
-//    -records                0x69120          -itemView       0x39e80
-//    -session                0x6c920(stub)    -side          0x70320
-//    -sc_recordsForSide:     0x3a170
+//  已验证选择器（ScreenCore 2.0.5 arm64）：
+//    -sc_openFrontmostApplicationAsSplitFromSourceRect:        0x48eb8
+//    -activeSession          0x65260(stub)   -dockManager      0x66880
+//    -records                0x69120          -itemView         0x39e80
+//    -session                0x6c920(stub)    -side             0x70320
+//    -sc_recordsForSide:      0x3a170
 //    -sc_targetFramesForSide: 0x3a384
-//    -sc_moveDraggingRecord:toSide:center: 0x3e5e4(stub 0x6af20)
+//    -sc_moveDraggingRecord:toSide:center: 0x3e5e4 (stub 0x6af20)
 //    -sc_dockedFloatingItemView:didMoveToCenter:state:velocity: 0x3f200
 //    -sc_restoreRecordToNormalFrame:animated:completion: 0x3c7e0
 //    -displayState / -setDisplayState: 0x66820 / 0x6d7a0(stub)
+//
+//  v0.1.7 修编译错误（上一版 CI 失败）：
+//    - 关联键改用 &static char，不能用 @"..."（ObjC++ 不隐式转 const void*）
+//    - NSNumber 才有 integerValue，NSValue 没有
+//    - switch/case 不能跨过强捕获 block 的生命周期，改用独立函数 + if/else
 //
 
 #import <Foundation/Foundation.h>
@@ -87,7 +92,6 @@
 - (NSArray *)sc_recordsForSide:(NSInteger)side;
 - (NSDictionary *)sc_targetFramesForSide:(NSInteger)side;
 - (void)sc_moveDraggingRecord:(id)record toSide:(NSInteger)side center:(CGPoint)center;
-- (void)sc_applyFrame:(CGRect)frame toRecord:(id)record;
 - (void)sc_dockedFloatingItemView:(UIView *)itemView
                    didMoveToCenter:(CGPoint)center
                             state:(NSInteger)state
@@ -116,6 +120,8 @@ static void (*orig_didMoveToCenter)(id, SEL, UIView *, CGPoint, NSInteger, CGPoi
 
 // record -> NSValue(CGPoint)：用户希望的卡片中心（hostRootView 坐标系）
 static char kFreeCenterKey;
+// record -> NSNumber(NSInteger)：钉住的 side
+static char kPinnedSideKey;
 
 #pragma mark - 偏好
 
@@ -272,13 +278,13 @@ static void hook_moveDraggingRecord(id self, SEL _cmd, id record, NSInteger side
 
     // 记录落点；同时把 side 钉住，避免 0x3e790 按 center.x 反复翻转 side（闪烁源）
     NSInteger pinned = side;
-    NSValue *oldSide = objc_getAssociatedObject(record, @"kPinnedSide");
-    if (oldSide) pinned = [oldSide integerValue];
+    NSNumber *oldSide = objc_getAssociatedObject(record, &kPinnedSideKey);
+    if ([oldSide isKindOfClass:[NSNumber class]]) pinned = [oldSide integerValue];
 
     objc_setAssociatedObject(record, &kFreeCenterKey,
                              [NSValue valueWithCGPoint:center],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(record, @"kPinnedSide",
+    objc_setAssociatedObject(record, &kPinnedSideKey,
                              @(pinned),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -303,10 +309,11 @@ static NSDictionary *hook_targetFramesForSide(id self, SEL _cmd, NSInteger side)
         if (!record) record = key;
 
         NSValue *custom = objc_getAssociatedObject(record, &kFreeCenterKey);
-        if (!custom) continue;
+        if (![custom isKindOfClass:[NSValue class]]) continue;
 
-        NSValue *pinnedSide = objc_getAssociatedObject(record, @"kPinnedSide");
-        if (pinnedSide && [pinnedSide integerValue] != side) continue;  // 只改它自己那一侧
+        NSNumber *pinnedSide = objc_getAssociatedObject(record, &kPinnedSideKey);
+        if ([pinnedSide isKindOfClass:[NSNumber class]] &&
+            [pinnedSide integerValue] != side) continue;  // 只改它自己那一侧
 
         CGRect slot = [frames[key] CGRectValue];          // 尺寸沿用槽位尺寸
         CGPoint c = sc_clampCenter([custom CGPointValue], slot.size, host);
@@ -325,10 +332,11 @@ static void hook_didMoveToCenter(id self, SEL _cmd, UIView *itemView, CGPoint ce
                                  NSInteger state, CGPoint velocity) {
     id record = sc_recordForItemView(self, itemView);
     NSValue *custom = record ? objc_getAssociatedObject(record, &kFreeCenterKey) : nil;
-    if (record && custom) {
+    if (record && [custom isKindOfClass:[NSValue class]]) {
         CGRect host = sc_hostBounds(self);
-        CGPoint c = sc_clampCenter([custom CGPointValue], itemView.bounds.size, host);
-        itemView.center = c;
+        CGSize size = itemView ? itemView.bounds.size : CGSizeMake(0, 0);
+        CGPoint c = sc_clampCenter([custom CGPointValue], size, host);
+        if (itemView) itemView.center = c;
         SC_LOG(@"didMove swallowed record=%p -> center=%@ (orig would use %@)",
                record, NSStringFromCGPoint(c), NSStringFromCGPoint(center));
         return;
@@ -337,6 +345,21 @@ static void hook_didMoveToCenter(id self, SEL _cmd, UIView *itemView, CGPoint ce
 }
 
 #pragma mark - 入口
+
+// 独立成函数，避免 switch/case 跨过 block 的强捕获生命周期（clang: cannot jump into block scope）
+static void sc_scheduleRestoreToFloating(SCFloatingSceneManager *manager) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            id session = [manager activeSession];
+            if (!session) {
+                SC_LOG(@"free path: activeSession == nil");
+                return;
+            }
+            sc_tryRestoreToNormalFloating(manager, session);
+        }
+    });
+}
 
 static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
     BOOL result = orig_openFrontmostAsSplit(self, _cmd, rect);
@@ -349,25 +372,13 @@ static BOOL hook_openFrontmostAsSplit(id self, SEL _cmd, CGRect rect) {
     NSInteger mode = sc_mode();
     SC_LOG(@"open ok, mode=%ld", (long)mode);
 
-    switch (mode) {
-        case 0:
-            @autoreleasepool { sc_dockSession(manager); }
-            break;
-        case 1:
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @autoreleasepool {
-                    id session = [manager activeSession];
-                    if (!session) { SC_LOG(@"free path: activeSession == nil"); return; }
-                    sc_tryRestoreToNormalFloating(manager, session);
-                }
-            });
-            break;
-        case 2:
-        default:
-            // 仍需 dock 到侧边，只是后续位置由 A/B/C 接管
-            @autoreleasepool { sc_dockSession(manager); }
-            break;
+    if (mode == 1) {
+        sc_scheduleRestoreToFloating(manager);
+    } else {
+        // 模式 0 与模式 2 都先 dock 到侧边；模式 2 的后续位置由三枚 dock hook 接管
+        @autoreleasepool {
+            sc_dockSession(manager);
+        }
     }
     return result;
 }
