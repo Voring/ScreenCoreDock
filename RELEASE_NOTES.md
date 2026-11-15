@@ -1,94 +1,84 @@
-# ScreenCoreDock v0.1.6
+# ScreenCoreDock v0.1.7
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.1.6`
+- 版本：`0.1.7`
 - 依赖：`com.susudear.screencore`
-- 架构：`iphoneos-arm64`（编译 arm64 + arm64e 双切片）
+- 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## 本版改动
-
-### 1. 修复：v0.1.5 把「转侧贴浮窗」改没了
-
-v0.1.5 删掉了打开后的 `-sc_dockSession:fromCorner:` 调用，导致工具回到原始分屏行为，侧贴浮窗功能消失。
-本版在默认模式下恢复该调用，行为等同 v0.1.0：打开后停靠到侧边（`splitDefaultDockSide` 决定左右）。
-
-### 2. 新增：自由浮窗模式（改用插件自己的「取消停靠」例程）
-
-不做 `setDisplayState` 硬改，改为调用插件内的
-`-sc_restoreRecordToNormalFrame:animated:completion:`（0x3c7e0）：
-它会把 record 放进 `restoringRecords`、`setDisplayState:3`、动画回 `normalFrame`，
-这是插件自己「把贴边卡片还原成普通浮窗」的正规路径。
-
-实现细节：
-
-- 打开成功后等 0.25s，让 dock 状态落地；
-- 取 `-dockManager`，遍历 `-sc_recordsForSide:`（side 1/2），按 `-[record session] == activeSession` 精确匹配，只处理本次打开的那一个；
-- 对命中 record 调用 `sc_restoreRecordToNormalFrame:animated:NO completion:nil`；
-- 兜底再 `setDisplayState:3`。
-
-### 3. 开关（不需要重编译）
+## 三种模式
 
 偏好域 `com.voring.screencoredock`，键 `FreeFloatMode`：
 
 | 值 | 行为 |
 |---|---|
-| 缺省 / `0` | 侧贴浮窗（v0.1.0 行为，默认） |
-| `1` | 取消停靠 → 普通浮窗（自由拖动） |
-
-写入方式（SSH 或 Filza 终端）：
+| 缺省 / `0` | 侧贴浮窗，沿侧边自上而下堆叠（v0.1.0 行为） |
+| `1` | 取消停靠 → 普通浮窗（displayState 3） |
+| `2` | **dock 内任意位置**：仍是侧贴状态，卡片停在拖拽落点，不再被"自上而下堆叠"拉回 |
 
 ```sh
-defaults write com.voring.screencoredock FreeFloatMode -bool YES
+defaults write com.voring.screencoredock FreeFloatMode -int 2
 killall -9 SpringBoard
 ```
 
-关闭自由浮窗：
+## 为什么"任意槽位"不存在（反汇编依据）
 
-```sh
-defaults write com.voring.screencoredock FreeFloatMode -bool NO
-killall -9 SpringBoard
-```
+- `-sc_updateNormalizedYForOrder:`（0x3e52c）：遍历数组，对每条 record 写
+  `normalizedY = (i+1)/(count+1)`。**完全不读落点 Y**；`normalizedY` 只用于排序。
+- `-sc_targetFramesForSide:`（0x3a384）：纵向没有槽位参数，Y 是逐条累加：
+  `0x3aa84: y = y + (gap + height)`，`gap = (count>1 ? 18 : 0)`。
+  所以纵向只有"堆叠"，不存在可选的槽位序号。
 
-## 两个模式的取舍（事实，不是猜测）
+结论：要让卡片停在任意位置，只能覆盖 `-sc_targetFramesForSide:` 返回的帧表，并摁住收尾层。
 
-侧贴（displayState 1）用 `(side, order)` 槽位模型，坐标由布局重算决定，**原生不支持脱离侧边自由摆放**；
-普通浮窗（displayState 3）才是自由拖动的状态。二者互斥，同一个 record 不能同时具备。
-所以本版做成开关，而不是把两种行为硬塞进同一个状态。
+## 模式 2 的三枚 hook
 
-## 验证日志
+1. `-sc_moveDraggingRecord:toSide:center:`
+   - 记下落点中心（hostRootView 坐标系）到 record 关联对象 `kFreeCenterKey`；
+   - 同时把 `side` 钉住（`kPinnedSide`），阻止 `0x3e790` 按 `center.x` 与帧 x 比较反复翻转 side —— 这是之前"左右闪烁"的直接原因。
+2. `-sc_targetFramesForSide:`
+   - 对带自由中心的 record，把槽位**平移**到该中心；
+   - **尺寸沿用槽位尺寸**（`-sc_applyFrame:toRecord:` 内部按 目标帧/normalFrame 尺寸比算缩放，改大尺寸会把卡片放大数倍，这是 v0.1.3 满屏 bug 的根因）；
+   - 只处理该 record 自己那一侧（按 `kPinnedSide` 过滤），避免另一侧把卡片重复摆一遍。
+3. `-sc_dockedFloatingItemView:didMoveToCenter:state:velocity:`
+   - 命中自由记录时**不调 orig**：它内部会再调 `moveDraggingRecord`、内联算槽位 x、对 y 夹紧，然后直接 `setCenter:` 到 itemView(0x3f74c) 与 containerView(0x3f77c)，绕过 applyFrame；
+   - 直接按自由中心 `setCenter:`，保持卡片位置。
+
+## 真机预期
+
+- 模式 2 下把卡片拖到任意位置松手，应停在原地（可不在边缘、可不按上下顺序）；
+- 不再左右闪烁；
+- 尺寸不变。
+
+若无效果，日志会直接指出断点，按下面关键字看：
 
 ```sh
 log stream --predicate 'eventMessage CONTAINS "ScreenCoreDock"'
 ```
 
-期望输出：
+- `hooked (mode=2, dockClass=...)`
+- `drag drop record=... pinned=... center=...`（说明 hook 1 命中）
+- `frames side=1 record=... A -> B`（说明 hook 2 命中，看 B 是否为你落点）
+- `didMove swallowed record=... -> center=...`（说明 hook 3 命中）
 
-- 启动：`hooked (mode=dock(0))` 或 `hooked (mode=free-float(1))`
-- 每次触发：`open ok, mode=...`
-- 模式 0：`dock path: corner=1 ok=1 session=0x...`
-- 模式 1：`free path: restored record 0x... (side=1)` + `free path: displayState 1 -> 3`
+若 `frames` 那行根本没出现，说明该侧布局没被重建，需要在 `-sc_applyFrame:toRecord:` 再兜一层；
+若出现但卡片仍回弹，说明还有别的 `setCenter:` 路径，把 `didMove swallowed` 后面的日志发我。
 
-## 真机待确认
-
-1. 模式 0 是否恢复侧贴浮窗（回到 v0.1.0 手感）；
-2. 模式 1 窗口是否变成可任意拖动、松手不回侧边的普通浮窗；
-3. 模式 1 若窗口尺寸变大，把 `free path: displayState ...` 附近日志发我。
-
-## 逆向备忘（arm64 切片，未滑动地址）
+## 逆向备忘（arm64，未滑动地址）
 
 | 地址 | 选择器 |
 |---|---|
 | `0x113a4` | `_SCFullscreenToSplitToolPerform` |
 | `0x48eb8` | `-sc_openFrontmostApplicationAsSplitFromSourceRect:` |
-| `0x46cf4` | `-sc_openSplitForBundleIdentifier:presentationSourceRect:` |
-| `0x463ac` | `-sc_dockSession:fromCorner:`（内部 `setDisplayState:1`） |
-| `0x462e4` | `-sc_dockSessionForSingleActiveWindow:` |
-| `0x3c7e0` | `-sc_restoreRecordToNormalFrame:animated:completion:`（`setDisplayState:3`） |
-| `0x3a170` | `-sc_recordsForSide:` |
+| `0x463ac` | `-sc_dockSession:fromCorner:` |
+| `0x3c7e0` | `-sc_restoreRecordToNormalFrame:animated:completion:` |
+| `0x3e52c` | `-sc_updateNormalizedYForOrder:` |
+| `0x3e5e4` | `-sc_moveDraggingRecord:toSide:center:` |
 | `0x3a384` | `-sc_targetFramesForSide:` |
 | `0x3ac70` | `-sc_applyFrame:toRecord:` |
-| `0x3e5e4` | `-sc_moveDraggingRecord:toSide:center:` |
+| `0x3ab14` | `-sc_dockTransformForRecord:targetFrame:` |
 | `0x3f200` | `-sc_dockedFloatingItemView:didMoveToCenter:state:velocity:` |
+| `0x3f664` | 收尾层内部调 `moveDraggingRecord` |
+| `0x3f74c` / `0x3f77c` | 收尾层直接 `setCenter:`（itemView / containerView） |

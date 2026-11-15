@@ -1,8 +1,8 @@
 Package: com.voring.screencoredock
 Name: ScreenCoreDock
-Version: 0.1.6
+Version: 0.1.7
 Architecture: iphoneos-arm64
-Description: 「全屏转ScreenCore分屏」改为侧贴浮窗（恢复 v0.1.0 行为），并可用 FreeFloatMode 切换为取消停靠的普通浮窗
+Description: 「全屏转ScreenCore分屏」改为侧贴浮窗；FreeFloatMode=0 侧边堆叠（默认）、=1 取消停靠普通浮窗、=2 dock 内任意位置摆放
 Maintainer: Voring
 Author: Voring
 Section: Tweaks
