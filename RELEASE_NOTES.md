@@ -1,20 +1,20 @@
-# ScreenCoreDock v0.3.9
+# ScreenCoreDock v0.3.10
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.9`
+- 版本：`0.3.10`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
 ## 本版改动
 
-只调触发区手感：底部中央触发区高度由 44pt 加到 **90pt**，其余逻辑不变。
+只调触发区手感：底部中央触发区高度由 90pt 调到 **75pt**，其余逻辑不变。
 
 ### 完整触发条件
 
-拖动浮窗（未侧贴）松手时，浮窗底边距屏幕底边 ≤ 90pt，且浮窗水平中心落在屏幕水平中心 ±67pt（总宽 134pt，即小横条宽度）内。
+拖动浮窗（未侧贴）松手时，浮窗底边距屏幕底边 ≤ 75pt，且浮窗水平中心落在屏幕水平中心 ±67pt（总宽 134pt，即小横条宽度）内。
 
 命中后走 `sc_handleFullscreenTap:` → 代理 `didRequestFullscreen`，与顶部手势区转全屏同一套。
 
