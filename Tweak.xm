@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.8
+//  ScreenCoreDock  v0.3.9
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
@@ -11,7 +11,7 @@
 //    4. 横屏卡片缩到 1/4 并重排（v0.2.x）：LandscapeDockScale 默认 0.5，左右间距对齐，顶部加一点点。
 //    5. 浮窗左侧手势区改为关闭浮窗（v0.3.1），顶部仍为全屏。
 //    6. 下拉通知中心不收回侧贴（v0.3.5）：按可见窗口类名判断 CoverSheet 在场。
-//    7. 拖动浮窗到底部中央窄条松手转全屏（v0.3.8）。
+//    7. 拖动浮窗到底部中央窄条松手转全屏（v0.3.8，触发区高 90pt）。
 //
 
 #import <Foundation/Foundation.h>
@@ -182,9 +182,9 @@ static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
 
 #pragma mark - 拖到底部中央窄条松手转全屏
 
-// 底部中央触发区：高度一指（44pt），宽度取小横条宽度（134pt），水平居中。
+// 底部中央触发区：高 90pt（自底边向上），宽取小横条宽度（134pt），水平居中。
 static BOOL sc_inBottomCenterStrip(CGRect frame, CGRect hostBounds) {
-    const CGFloat stripH = 44.0;
+    const CGFloat stripH = 90.0;
     const CGFloat stripW = 134.0;
     CGFloat bottom = CGRectGetMaxY(hostBounds);
     CGFloat centerX = CGRectGetMidX(hostBounds);
@@ -525,7 +525,7 @@ static void installHook(int attempt) {
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.8 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.9 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
