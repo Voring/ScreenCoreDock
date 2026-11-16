@@ -1,38 +1,44 @@
-# ScreenCoreDock v0.3.7
+# ScreenCoreDock v0.3.8
 
 ## 版本号
 
 - 包名：`com.voring.screencoredock`
-- 版本：`0.3.7`
+- 版本：`0.3.8`
 - 依赖：`mobilesubstrate, com.susudear.screencore`
 - 架构：`iphoneos-arm64`（编译 arm64 + arm64e）
 - 打包方案：`roothide`
 
-## 本版改动：修复 v0.3.5 引入的关闭/放大手势回归
+## 本版新增：拖到底部中央松手转全屏
 
-### 问题
+### 触发条件
 
-v0.3.5 起：浮窗左/右/下侧点击不再关闭浮窗，点击侧贴也不再放大浮窗。
+拖动浮窗（未侧贴状态）松手时，浮窗底部边缘进入屏幕底部中央窄条：
 
-### 原因
+- 触发区高度：一指距离（44pt，自屏幕底边向上）；
+- 触发区宽度：小横条宽度（134pt，水平居中）；
+- 判定：浮窗水平中心落在窄条宽度内，且浮窗底边距屏幕底边 ≤ 44pt。
 
-通知中心在场判定遍历 `[UIApplication sharedApplication].windows` 时，把**收起后仍留在数组里的隐藏 CoverSheet 窗口**也算成在场，导致 `sc_closeSession:animated:` / `sc_undockSession:animated:` 等正常关闭、放大调用被无条件跳过。
+命中后走原有的全屏提升链路（`sc_handleFullscreenTap:` → 代理 `didRequestFullscreen`），与顶部手势区转全屏同一套。
 
-### 修复
+### 实现
 
-- 窗口类名匹配前先跳过 `isHidden == YES` 的窗口；
-- 启动 0.5s 后打一条可见窗口清单（类名 / hidden / level），用于确认到底命中了哪个类。
+- hook 容器视图 `-sc_handleMoveGesture:`（pan 手势），原方法跑完后判断手势结束态；
+- 已侧贴（`isDocked == YES`）不参与；
+- 帧坐标换算到父视图（host）坐标系后再做窄条判定。
 
-### 行为保持不变
+### 既有行为保持不变
 
-下拉通知中心时侧贴仍不被收回；横屏已侧贴应用不被强制下掉；横屏侧贴位置与 1/4 缩放保留；左侧手势区关闭浮窗。
+- 左/右/下侧点击关闭浮窗，顶部点击转全屏；
+- 左侧手势区为关闭；
+- 下拉通知中心不收回侧贴；
+- 横屏已侧贴应用不被强制下掉，横屏侧贴位置与 1/4 缩放保留。
 
-### 装完请回传
+### 日志
 
-日志路径：`/var/mobile/Library/Logs/ScreenCoreDock.log`（不可写则 `/tmp/ScreenCoreDock.log`），关注启动后那条：
+命中触发区时记录：
 
 ```
-visible windows: ...
+drag-to-bottom-center -> fullscreen, frame={{...}}
 ```
 
-如果本版关闭/放大仍失效，把这一行连同复现步骤回传。
+日志路径：`/var/mobile/Library/Logs/ScreenCoreDock.log`（不可写则 `/tmp/ScreenCoreDock.log`）。
