@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.7
+//  ScreenCoreDock  v0.3.8
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
@@ -11,6 +11,7 @@
 //    4. 横屏卡片缩到 1/4 并重排（v0.2.x）：LandscapeDockScale 默认 0.5，左右间距对齐，顶部加一点点。
 //    5. 浮窗左侧手势区改为关闭浮窗（v0.3.1），顶部仍为全屏。
 //    6. 下拉通知中心不收回侧贴（v0.3.5）：按可见窗口类名判断 CoverSheet 在场。
+//    7. 拖动浮窗到底部中央窄条松手转全屏（v0.3.8）。
 //
 
 #import <Foundation/Foundation.h>
@@ -78,6 +79,8 @@ static void SCLogAppend(NSString *msg) {
 @interface SCFloatingContainerView : NSObject
 - (void)sc_handleFullscreenTap:(id)gesture;
 - (void)sc_handleCloseTap:(id)gesture;
+- (void)sc_handleMoveGesture:(UIPanGestureRecognizer *)gesture;
+- (BOOL)isDocked;
 @end
 
 @interface SCFloatingDockManager : NSObject
@@ -97,6 +100,7 @@ static void (*orig_orientationDidChange)(id, SEL, NSInteger, double);
 static void (*orig_restoreAllDocked)(id, SEL, BOOL);
 static NSDictionary *(*orig_targetFramesForSide)(id, SEL, NSInteger);
 static void (*orig_handleFullscreenTap)(id, SEL, id);
+static void (*orig_handleMoveGesture)(id, SEL, id);
 static void (*orig_undockSession)(id, SEL, id, BOOL);
 static void (*orig_closeSession)(id, SEL, id, BOOL);
 static void (*orig_closeAllSessions)(id, SEL);
@@ -174,6 +178,43 @@ static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
     }
 
     if (orig_handleFullscreenTap) orig_handleFullscreenTap(self, _cmd, gesture);
+}
+
+#pragma mark - 拖到底部中央窄条松手转全屏
+
+// 底部中央触发区：高度一指（44pt），宽度取小横条宽度（134pt），水平居中。
+static BOOL sc_inBottomCenterStrip(CGRect frame, CGRect hostBounds) {
+    const CGFloat stripH = 44.0;
+    const CGFloat stripW = 134.0;
+    CGFloat bottom = CGRectGetMaxY(hostBounds);
+    CGFloat centerX = CGRectGetMidX(hostBounds);
+    CGFloat frameCenterX = frame.origin.x + frame.size.width * 0.5;
+    if (CGRectGetMaxY(frame) < bottom - stripH) return NO;
+    if (frameCenterX < centerX - stripW * 0.5) return NO;
+    if (frameCenterX > centerX + stripW * 0.5) return NO;
+    return YES;
+}
+
+static void hook_handleMoveGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture) {
+    orig_handleMoveGesture(self, _cmd, gesture);
+
+    @try {
+        if (!gesture || gesture.state != UIGestureRecognizerStateEnded) return;
+        if ([self respondsToSelector:@selector(isDocked)] && [self isDocked]) return;
+
+        UIView *view = (UIView *)self;
+        UIView *host = [view superview];
+        CGRect hostBounds = host ? host.bounds : [UIScreen mainScreen].bounds;
+        CGRect frame = host ? [view convertRect:view.bounds toView:host] : view.frame;
+
+        if (sc_inBottomCenterStrip(frame, hostBounds)) {
+            SC_LOG(@"drag-to-bottom-center -> fullscreen, frame=%@",
+                   NSStringFromCGRect(frame));
+            [(SCFloatingContainerView *)self sc_handleFullscreenTap:gesture];
+        }
+    } @catch (NSException *e) {
+        SC_LOG(@"drag-to-fullscreen threw %@", e.reason);
+    }
 }
 
 #pragma mark - 下拉通知中心时保留侧贴
@@ -447,6 +488,13 @@ static void installHook(int attempt) {
                         @selector(sc_handleFullscreenTap:),
                         (IMP)hook_handleFullscreenTap,
                         (IMP *)&orig_handleFullscreenTap);
+
+        if ([containerCls instancesRespondToSelector:@selector(sc_handleMoveGesture:)]) {
+            MSHookMessageEx(containerCls,
+                            @selector(sc_handleMoveGesture:),
+                            (IMP)hook_handleMoveGesture,
+                            (IMP *)&orig_handleMoveGesture);
+        }
     }
 
     Class dockCls = objc_getClass("SCFloatingDockManager");
@@ -477,7 +525,7 @@ static void installHook(int attempt) {
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.7 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.3.8 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
