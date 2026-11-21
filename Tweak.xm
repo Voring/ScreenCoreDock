@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.4.0
+//  ScreenCoreDock  v0.4.1
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
@@ -166,19 +166,17 @@ static BOOL hook_dockSession(id self, SEL _cmd, id session, NSInteger corner) {
 
 static void hook_handleFullscreenTap(id self, SEL _cmd, id gesture) {
     UIView *region = nil;
-    @try { region = [gesture view]; }
-    @catch (__unused NSException *e) {}
-
     NSString *ident = nil;
-    @try { ident = [region accessibilityIdentifier]; }
-    @catch (__unused NSException *e) {}
+    @try {
+        region = [gesture view];
+        ident = [region accessibilityIdentifier];
+    } @catch (__unused NSException *e) {}
 
     if (ident && [ident isEqualToString:@"ScreenCore.Split.LeftMoveFullscreen"]) {
         [(SCFloatingContainerView *)self sc_handleCloseTap:gesture];
         return;
     }
-
-    if (orig_handleFullscreenTap) orig_handleFullscreenTap(self, _cmd, gesture);
+    orig_handleFullscreenTap(self, _cmd, gesture);
 }
 
 #pragma mark - 拖到底部中央窄条松手转全屏
@@ -236,22 +234,6 @@ static BOOL sc_windowClassNameContains(const char *needle) {
     return NO;
 }
 
-static void sc_dumpVisibleWindows(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        NSArray *windows = nil;
-        @try { windows = [UIApplication sharedApplication].windows; }
-        @catch (__unused NSException *e) {}
-        NSMutableString *names = [NSMutableString string];
-        for (UIWindow *w in windows) {
-            const char *n = object_getClassName(w);
-            [names appendFormat:@"%s(hidden=%d,level=%.0f) ", n ? n : "?",
-             (int)w.isHidden, w.windowLevel];
-        }
-        SC_LOG(@"visible windows: %@", names);
-    });
-}
-
 // 锁屏态：用 libnotify 的 lockstate 键值，不碰任何 SpringBoard 私有类/单例。
 #ifdef __cplusplus
 extern "C" {
@@ -292,7 +274,6 @@ static void hook_closeSessionAnimated(id self, SEL _cmd, id session, BOOL animat
 }
 
 static void hook_closeAllSessions(id self, SEL _cmd) {
-    if (sc_deviceLocked()) SC_LOG(@"locked -> closeAllSessions passthrough");
     if (sc_coverSheetPresented()) return;
     orig_closeAllSessions(self, _cmd);
 }
@@ -316,19 +297,18 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            for (NSInteger side = 1; side <= 2; side++) {
-                @try {
+            @try {
+                for (NSInteger side = 1; side <= 2; side++) {
                     if ([dock respondsToSelector:@selector(sc_layoutSide:animated:completion:)]) {
                         [(SCFloatingDockManager *)dock sc_layoutSide:side animated:NO completion:nil];
                     }
-                } @catch (__unused NSException *e) {}
-            }
+                }
+            } @catch (__unused NSException *e) {}
         }
     });
 }
 
 static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
-    if (sc_deviceLocked()) SC_LOG(@"locked -> restoreAllDocked passthrough");
     if (sc_coverSheetPresented()) return;
 
     if (sc_inOrientationChange) {
@@ -546,13 +526,12 @@ static void installHook(int attempt) {
         }
     }
 
-    sc_dumpVisibleWindows();
     SC_LOG(@"hooked: open + dockSession + orientation + restoreAllDocked + targetFrames + leftRegionClose + keepOnCoverSheet");
 }
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.4.0 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.4.1 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
