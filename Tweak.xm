@@ -1,6 +1,6 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.3.10
+//  ScreenCoreDock  v0.4.0
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
@@ -12,6 +12,7 @@
 //    5. 浮窗左侧手势区改为关闭浮窗（v0.3.1），顶部仍为全屏。
 //    6. 下拉通知中心不收回侧贴（v0.3.5）：按可见窗口类名判断 CoverSheet 在场。
 //    7. 拖动浮窗到底部中央窄条松手转全屏（v0.3.8，触发区高 75pt）。
+//    8. 锁屏时不再保留侧贴与浮窗（v0.4.0）：锁屏态下禁用 CoverSheet 保留判定，按原生行为收起。
 //
 
 #import <Foundation/Foundation.h>
@@ -251,7 +252,25 @@ static void sc_dumpVisibleWindows(void) {
     });
 }
 
+// 锁屏态：用 libnotify 的 lockstate 键值，不碰任何 SpringBoard 私有类/单例。
+extern uint32_t notify_register_check(const char *name, int *out_token);
+extern uint32_t notify_get_state(int token, uint64_t *state);
+
+static BOOL sc_deviceLocked(void) {
+    static int token = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        notify_register_check("com.apple.springboard.lockstate", &token);
+    });
+    if (token == 0) return NO;
+    uint64_t state = 0;
+    if (notify_get_state(token, &state) != 0) return NO;
+    return state != 0;
+}
+
 static BOOL sc_coverSheetPresented(void) {
+    // 锁屏时不做保留：侧贴与浮窗按原生行为收起
+    if (sc_deviceLocked()) return NO;
     return sc_windowClassNameContains("CoverSheet")
         || sc_windowClassNameContains("NotificationCenter");
 }
@@ -267,6 +286,7 @@ static void hook_closeSessionAnimated(id self, SEL _cmd, id session, BOOL animat
 }
 
 static void hook_closeAllSessions(id self, SEL _cmd) {
+    if (sc_deviceLocked()) SC_LOG(@"locked -> closeAllSessions passthrough");
     if (sc_coverSheetPresented()) return;
     orig_closeAllSessions(self, _cmd);
 }
@@ -302,6 +322,7 @@ static void hook_orientationDidChange(id self, SEL _cmd, NSInteger orientation, 
 }
 
 static void hook_restoreAllDocked(id self, SEL _cmd, BOOL animated) {
+    if (sc_deviceLocked()) SC_LOG(@"locked -> restoreAllDocked passthrough");
     if (sc_coverSheetPresented()) return;
 
     if (sc_inOrientationChange) {
@@ -525,7 +546,7 @@ static void installHook(int attempt) {
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.3.10 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.4.0 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
