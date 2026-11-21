@@ -253,8 +253,14 @@ static void sc_dumpVisibleWindows(void) {
 }
 
 // 锁屏态：用 libnotify 的 lockstate 键值，不碰任何 SpringBoard 私有类/单例。
-extern uint32_t notify_register_check(const char *name, int *out_token);
-extern uint32_t notify_get_state(int token, uint64_t *state);
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t notify_register_check(const char *name, int *out_token);
+uint32_t notify_get_state(int token, uint64_t *state);
+#ifdef __cplusplus
+}
+#endif
 
 static BOOL sc_deviceLocked(void) {
     static int token = 0;
