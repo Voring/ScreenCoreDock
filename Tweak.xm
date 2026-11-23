@@ -1,11 +1,11 @@
 //
 //  Tweak.xm
-//  ScreenCoreDock  v0.4.2
+//  ScreenCoreDock  v0.4.3
 //
 //  把 ScreenCore「全屏转ScreenCore分屏」改为「全屏转侧贴浮窗」。
 //
 //  功能清单（本版只保留这些）：
-//    1. 打开分屏后补一次 dock（v0.1.0 基线，corner 取 splitDefaultDockSide）。
+//    1. 打开分屏后补一次 dock（v0.1.0 基线；v0.4.3 起固定贴右侧）。
 //    2. 横屏也能转侧贴（v0.1.8）：dock 被方向守卫拒掉时临时顶成竖屏重入，再兜底走 DockManager。
 //    3. 转进横屏不强制收回侧贴（v0.1.9）。
 //    4. 横屏卡片缩到 1/4 并重排（v0.2.x）：LandscapeDockScale 默认 0.5，左右间距对齐，顶部加一点点。
@@ -104,11 +104,9 @@ static BOOL sc_forcePortrait = NO;
 // 只在插件处理方向切换期间为 YES
 static BOOL sc_inOrientationChange = NO;
 
+// 固定贴右侧（corner 2）。要改回左侧把这里的 2 改成 1。
 static NSInteger sc_defaultDockCorner(void) {
-    NSNumber *side = (__bridge_transfer NSNumber *)CFPreferencesCopyAppValue(
-        CFSTR("splitDefaultDockSide"), SC_DOMAIN);
-    if (![side isKindOfClass:[NSNumber class]]) return 1;
-    return ([side integerValue] == 1) ? 2 : 1;
+    return 2;
 }
 
 #pragma mark - 横屏放开 dock 入口
@@ -440,7 +438,7 @@ static void installHook(int attempt) {
 
 %ctor {
     @autoreleasepool {
-        SC_LOG(@"v0.4.2 loaded in %@", [[NSProcessInfo processInfo] processName]);
+        SC_LOG(@"v0.4.3 loaded in %@", [[NSProcessInfo processInfo] processName]);
         installHook(0);
     }
 }
